@@ -20,9 +20,6 @@ from peft.tuners.lora import LoraConfig
 from peft.utils import PeftType
 
 
-PeftType.INCRELORA = "INCRELORA"
-
-
 @dataclass
 class IncreLoraConfig(LoraConfig):
     """
@@ -40,16 +37,23 @@ class IncreLoraConfig(LoraConfig):
     target_r: int = field(default=8, metadata={"help": "Target Lora matrix dimension."})
     init_r: int = field(default=12, metadata={"help": "Initial Lora matrix dimension."})
 
-    deltaT: int = field(default=1000, metadata={
-        "help": "The time internval between two budget allocations."})
+    deltaT: int = field(default=1000, metadata={"help": "The time internval between two budget allocations."})
 
     top_h: int = field(default=5, metadata={"help": "The number of modules selected."})
-    reserve_ranks: int = field(default=1, metadata={"help": (
-        "The number of ranks to add per selected module. If `alternative_scoring` is "
-        "enabled, it determines the number of reserve ranks that are added to each module."
-    )})
+    reserve_ranks: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "The number of ranks to add per selected module. If `alternative_scoring` is "
+                "enabled, it determines the number of reserve ranks that are added to each module."
+            )
+        },
+    )
 
-    alternative_scoring: bool = False
+    alternative_scoring: bool = field(
+        default=False, metadata={"help": "Whether to use the alternative scoring scheme."}
+    )
+    orthonormalize: bool = field(default=False, metadata={"help": "Whether to enforce orthonormalization."})
 
     tinit: int = field(default=0, metadata={"help": "The steps of initial warmup."})
     tfinal: int = field(default=0, metadata={"help": "The steps of final warmup."})
@@ -68,7 +72,9 @@ class IncreLoraConfig(LoraConfig):
         if self.loftq_config:
             raise ValueError(f"{self.peft_type} does not support LOFTQ.")
 
-        self.target_modules = set(self.target_modules) if isinstance(self.target_modules, list) else self.target_modules
+        self.target_modules = (
+            set(self.target_modules) if isinstance(self.target_modules, list) else self.target_modules
+        )
         # if target_modules is a regex expression, then layers_to_transform should be None
         if isinstance(self.target_modules, str) and self.layers_to_transform is not None:
             raise ValueError("`layers_to_transform` cannot be used when `target_modules` is a str.")

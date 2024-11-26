@@ -14,15 +14,16 @@
 
 import math
 import warnings
+from functools import partial
 from itertools import chain
 from typing import Any, List, Optional
 
 import torch
+from torch import nn
+
 from peft.tuners.lora import LoraLayer
 from peft.tuners.tuners_utils import check_adapters_to_merge
 from peft.utils import transpose
-from torch import nn
-
 
 
 class IncreLoraLayer(LoraLayer):
@@ -84,16 +85,6 @@ class IncreLoraLayer(LoraLayer):
                 nn.init.normal_(p, mean=0.0, std=0.02)
 
 
-
-class loraW(nn.Module):
-    """Required to retrieve the gradient on the backward pass"""
-
-    def __init__(self):
-        super().__init__()
-    def forward(self, A, E, B, scaling, ranknum):
-        return B @ (A * E) * scaling / (ranknum+1e-5)
-
-
 class SVDLinear(nn.Module, IncreLoraLayer):
     # SVD-based adaptation by a dense layer
     def __init__(
@@ -115,9 +106,6 @@ class SVDLinear(nn.Module, IncreLoraLayer):
         self.fan_in_fan_out = fan_in_fan_out
         self._active_adapter = adapter_name
         self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
-
-        self.W = loraW()
-        self.hook_handle = self.W.register_full_backward_hook(self.backward_hook)
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
         """
@@ -178,17 +166,10 @@ class SVDLinear(nn.Module, IncreLoraLayer):
             / (self.ranknum[adapter] + 1e-5)
         )
 
-    def backward_hook(self, module, grad_input, grad_output):
-        # print("Output_Grad:", grad_output)
-        self.score = 0
-        grad_Matrix = grad_output[0]
-
-        for adapter in self.active_adapters:
-            W = self.get_delta_weight(adapter)
-                # scale_W = torch.mean(W)
-            self.score = torch.sum((W  * grad_Matrix).abs().detach()) / math.sqrt(W.numel())
-            # self.score = torch.mean((grad_Matrix ** 2).detach())
-
+    def backward_hook(self, w, grad):
+        # scale_W = torch.mean(W)
+        self.score = torch.sum((w * grad).abs().detach()) / math.sqrt(w.numel())
+        # self.score = torch.mean((grad_Matrix ** 2).detach())
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         if self.disable_adapters:
@@ -200,29 +181,39 @@ class SVDLinear(nn.Module, IncreLoraLayer):
         else:
             result = self.base_layer(x, *args, **kwargs)
             for active_adapter in self.active_adapters:
-                if active_adapter not in self.lora_A.keys():
+                if active_adapter not in self.lora_A.keys() or len(self.lora_A[active_adapter]) == 0:
                     continue
-                lora_A = torch.cat(tuple(self.lora_A[active_adapter]), 0)
-                lora_B = torch.cat(tuple(self.lora_B[active_adapter]), 1)
-                lora_E = torch.cat(tuple(self.lora_E[active_adapter]), 0)
 
                 dropout = self.lora_dropout[active_adapter]
-                scaling = self.scaling[active_adapter]
-                ranknum = self.ranknum[active_adapter] + 1e-5
+                x = x.to(self.lora_A[active_adapter][0].dtype)
 
-                x = x.to(lora_A.dtype)
-                #result += (dropout(x) @ (lora_A * lora_E).T @ lora_B.T) * scaling / ranknum
-                result += dropout(x) @ self.W(lora_A, lora_E, lora_B, scaling, ranknum).T
+                if self.training:
+                    w = self.get_delta_weight(active_adapter)
+                    w.register_hook(partial(self.backward_hook, w))
+                    result += dropout(x) @ w.T
+                else:
+                    lora_A = torch.cat(tuple(self.lora_A[active_adapter]), 0)
+                    lora_B = torch.cat(tuple(self.lora_B[active_adapter]), 1)
+                    lora_E = torch.cat(tuple(self.lora_E[active_adapter]), 0)
+
+                    scaling = self.scaling[active_adapter]
+                    ranknum = self.ranknum[active_adapter] + 1e-5
+                    result += (dropout(x) @ (lora_A * lora_E).T @ lora_B.T) * scaling / ranknum
         return result
 
     def __repr__(self) -> str:
         rep = super().__repr__()
         return "increlora." + rep
 
-    def add_reserve_ranks(self, adapter_name, add_r) -> list[nn.Parameter]:
+    def add_reserve_ranks(self, adapter_name, add_r, grad_e: bool = False) -> list[nn.Parameter]:
         parameters: list[nn.Parameter] = []
         for _ in range(add_r):
-            e = nn.Parameter(self.weight.new_zeros(1, 1), requires_grad=False)
+            e = nn.Parameter(
+                self.weight.new_zeros(1, 1),
+                # if alternative_scoring is used the parameter is not trained,
+                # but the the gradient is still requiered
+                requires_grad=grad_e,
+            )
             a = nn.Parameter(self.weight.new_zeros((1, self.in_features)), requires_grad=True)
             b = nn.Parameter(self.weight.new_zeros((self.out_features, 1)), requires_grad=True)
             e[0][0] = 1e-5
@@ -234,6 +225,3 @@ class SVDLinear(nn.Module, IncreLoraLayer):
 
             parameters.extend((a, b))
         return parameters
-
-
-

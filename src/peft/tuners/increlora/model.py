@@ -15,18 +15,17 @@
 import warnings
 
 import torch
+from transformers.pytorch_utils import Conv1D
+
 from peft.tuners.lora import LoraConfig, LoraModel
 from peft.tuners.tuners_utils import BaseTunerLayer
 from peft.utils import (
     TRANSFORMERS_MODELS_TO_ADALORA_TARGET_MODULES_MAPPING,
     _freeze_adapter,
-    _get_submodules,
 )
 from peft.utils.integrations import gather_params_ctx
-from transformers.pytorch_utils import Conv1D
 
 from .layer import IncreLoraLayer, SVDLinear
-from .rank_allocator import RankAllocator
 
 
 class IncreLoraModel(LoraModel):

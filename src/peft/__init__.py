@@ -63,6 +63,8 @@ from .tuners import (
     IA3Model,
     AdaLoraConfig,
     AdaLoraModel,
+    IncreLoraConfig,
+    IncreLoraModel,
     BOFTConfig,
     BOFTModel,
     PrefixEncoder,

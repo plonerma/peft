@@ -12,23 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Union, Callable
-import packaging
-import torch
-import transformers
 import logging
 import math
 from functools import partial
+from typing import Callable, Union
 
-from peft import PeftModel
+import packaging
+import torch
+import transformers
+
 
 if packaging.version.parse(transformers.__version__) >= packaging.version.parse("4.33.0"):
     from transformers.integrations import deepspeed_config
 else:
     from transformers.deepspeed import deepspeed_config
 
-from .layer import SVDLinear
+from ..adalora.gram_schmidt import gram_schmidt_orthonormalize_model
 from .config import IncreLoraConfig
+from .layer import SVDLinear
+from .model import IncreLoraModel
+
 
 logger = logging.getLogger(__name__)
 
@@ -42,16 +45,16 @@ class RankAllocator:
         model: the model that we apply IncreLoRA to.
 
     """
+
     current_total_rank: int
     total_modules: int
     total_steps: int
 
     def __init__(
         self,
-        model: PeftModel,
+        model: IncreLoraModel,
         peft_config: IncreLoraConfig,
         adapter_name: str,
-        weight_decay: float,
         track_metrics: Callable = lambda _: None,
     ):
         self.peft_config = peft_config
@@ -62,8 +65,6 @@ class RankAllocator:
         self.track_metrics = track_metrics
         assert self.beta1 > 0 and self.beta1 < 1
         assert self.beta2 > 0 and self.beta2 < 1
-
-        self.weight_decay = weight_decay
 
         self.reset_ipt()
 
@@ -79,21 +80,21 @@ class RankAllocator:
     def reserve_ranks(self):
         return self.peft_config.reserve_ranks
 
-    def setup(self, *, total_steps, optimizer, model, **kw):
+    def setup(self, *, total_steps, optimizer, model, weight_decay):
         total_modules: int = 0
         for layer in model.modules():
-                if isinstance(layer, SVDLinear):
-                    total_modules += 1
+            if isinstance(layer, SVDLinear):
+                total_modules += 1
 
         self.total_steps = total_steps
         self.total_modules = total_modules
         self.total_current_rank = total_modules * self.peft_config.init_r
 
+        self.weight_decay = weight_decay
+
         rank_per_round = self.top_h * self.reserve_ranks
 
-        total_additional_rank = self.total_modules * (
-            self.peft_config.target_r - self.peft_config.init_r
-        )
+        total_additional_rank = self.total_modules * (self.peft_config.target_r - self.peft_config.init_r)
 
         num_rounds = math.ceil(total_additional_rank / rank_per_round)
 
@@ -101,17 +102,23 @@ class RankAllocator:
 
         logger.info(
             "Total incremental step: total_incre_step: %d, of total steps: %.2f (%d modules)",
-            total_incre_step, total_incre_step / total_steps, self.total_modules)
-
+            total_incre_step,
+            total_incre_step / total_steps,
+            self.total_modules,
+        )
 
         new_params = []
 
         for module in model.modules():
             if isinstance(module, SVDLinear):
-                new_params.extend(
-                    module.add_reserve_ranks(self.adapter_name, self.peft_config.reserve_ranks))
+                new_params.extend(module.add_reserve_ranks(self.adapter_name, self.peft_config.reserve_ranks, grad_e=self.peft_config.alternative_scoring))
 
-        optimizer.add_param_group({'params': new_params, "weight_decay": self.weight_decay,})
+        optimizer.add_param_group(
+            {
+                "params": new_params,
+                "weight_decay": self.weight_decay,
+            }
+        )
 
     def reset_ipt(self):
         self.ipt = {}
@@ -134,7 +141,7 @@ class RankAllocator:
                         len(layer.lora_E),
                         dtype=layer.lora_E.dtype,
                         device=layer.lora_E.device,
-                        requires_grad=False
+                        requires_grad=False,
                     )
 
                     self.ipt[n] = zeros()
@@ -160,19 +167,19 @@ class RankAllocator:
                     )
 
             else:
-                    if n not in self.ipt:
-                        self.ipt[n] = 0
-                        self.exp_avg_ipt[n] = 0
-                        self.exp_avg_unc[n] = 0
+                if n not in self.ipt:
+                    self.ipt[n] = 0
+                    self.exp_avg_ipt[n] = 0
+                    self.exp_avg_unc[n] = 0
 
-                    self.ipt[n] = layer.score
+                self.ipt[n] = layer.score
 
-                    # Update sensitivity
-                    self.exp_avg_ipt[n] = self.beta1 * self.exp_avg_ipt[n] + \
-                                            (1-self.beta1)*self.ipt[n]
-                    # Update uncertainty
-                    self.exp_avg_unc[n] = self.beta2 * self.exp_avg_unc[n] + \
-                                            (1-self.beta2)*(self.ipt[n]-self.exp_avg_ipt[n]).abs()
+                # Update sensitivity
+                self.exp_avg_ipt[n] = self.beta1 * self.exp_avg_ipt[n] + (1 - self.beta1) * self.ipt[n]
+                # Update uncertainty
+                self.exp_avg_unc[n] = (
+                    self.beta2 * self.exp_avg_unc[n] + (1 - self.beta2) * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
+                )
 
     def retrieve_scores(self, model) -> dict[str, torch.Tensor]:
         module_scores: dict[str, torch.Tensor] = {}
@@ -181,7 +188,9 @@ class RankAllocator:
         for n, layer in model.named_modules():
             if isinstance(layer, SVDLinear):
                 if self.alternative_scoring:
-                    module_scores[n] = self.exp_avg_ipt[n][-self.reserve_ranks:] * self.exp_avg_unc[n][-self.reserve_ranks:]
+                    module_scores[n] = (
+                        self.exp_avg_ipt[n][-self.reserve_ranks :] * self.exp_avg_unc[n][-self.reserve_ranks :]
+                    )
                 else:
                     module_scores[n] = self.exp_avg_ipt[n] * self.exp_avg_unc[n]
 
@@ -200,7 +209,7 @@ class RankAllocator:
         num_added: int
         if isinstance(ranks_to_add, int):
             num_added = ranks_to_add
-            ranks_to_add = [True]*ranks_to_add
+            ranks_to_add = [True] * ranks_to_add
         else:
             num_added = sum(ranks_to_add)
 
@@ -217,7 +226,7 @@ class RankAllocator:
             param_e.requires_grad = True
             new_paramters.append(param_e)
 
-        new_paramters.extend(layer.add_reserve_ranks(self.adapter_name, num_added))
+        new_paramters.extend(layer.add_reserve_ranks(self.adapter_name, num_added, grad_e=self.peft_config.alternative_scoring))
         return new_paramters
 
     def increase_to_target_rank(self, model, optimizer):
@@ -244,7 +253,7 @@ class RankAllocator:
                         ranks_to_add = (module_scores[n] >= increase_threshold).tolist()
 
                         if any(ranks_to_add):
-                            num_prev_params = (len(layer.lora_E[self.adapter_name]) - len(ranks_to_add))
+                            num_prev_params = len(layer.lora_E[self.adapter_name]) - len(ranks_to_add)
 
                             # fill up the mask
                             ranks_to_add = [False] * num_prev_params + ranks_to_add
@@ -264,15 +273,19 @@ class RankAllocator:
 
             metrics["total_rank"] = self.total_current_rank
 
-            optimizer.add_param_group({
-                "params": new_param_list, "weight_decay": self.weight_decay,})
+            optimizer.add_param_group(
+                {
+                    "params": new_param_list,
+                    "weight_decay": self.weight_decay,
+                }
+            )
 
             if self.total_current_rank == self.total_target_rank:
                 for module in model.modules():
                     if isinstance(module, SVDLinear):
                         module.hook_handle.remove()
-                        for param in module.lora_E[ -self.peft_config.reserve_ranks: ]:
-                            param.fill_(0.)
+                        for param in module.lora_E[-self.peft_config.reserve_ranks :]:
+                            param.fill_(0.0)
 
             metrics["budget/total_rank"] = self.total_current_rank
             metrics["budget/increase_threshold"] = increase_threshold
@@ -280,7 +293,6 @@ class RankAllocator:
             self.track_metrics(metrics)
 
         return increase_threshold
-
 
     def update_and_allocate(self, model, global_step, optimizer, training_args, **kw):
         if self.total_current_rank < self.total_target_rank:
@@ -291,12 +303,15 @@ class RankAllocator:
             ):
                 self.increase_to_target_rank(model, optimizer)
 
+        if self.peft_config.orthonormalize:
+            gram_schmidt_orthonormalize_model(model)
+
         metrics = {}
 
         def compute_and_log(mat_cov, name):
             I = torch.eye(*mat_cov.size(), out=torch.empty_like(mat_cov))
             I.requires_grad = False
-            orth_regu = torch.norm(mat_cov-I, p="fro")
+            orth_regu = torch.norm(mat_cov - I, p="fro")
             regu_loss.append(orth_regu.item())
             metrics[f"Orth_regu_loss/{name}"] = orth_regu.item()
 
@@ -309,9 +324,9 @@ class RankAllocator:
                         wB = torch.cat(list(layer.lora_B[self.adapter_name]), 1)
                         mat_cov_A = wA @ wA.T
                         mat_cov_B = wB.T @ wB
-                        compute_and_log(mat_cov_A, n+".lora_A")
-                        compute_and_log(mat_cov_B, n+".lora_B")
+                        compute_and_log(mat_cov_A, n + ".lora_A")
+                        compute_and_log(mat_cov_B, n + ".lora_B")
 
-                metrics["train/orth_regu_loss"] = sum(regu_loss)/len(regu_loss)
+                metrics["train/orth_regu_loss"] = sum(regu_loss) / len(regu_loss)
 
             self.track_metrics(metrics)

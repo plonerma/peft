@@ -31,6 +31,9 @@ else:
     from transformers.deepspeed import deepspeed_config
 
 
+from .gram_schmidt import gram_schmidt_orthonormalize_model
+
+
 class AdaLoraLayer(LoraLayer):
     # List all names of layers that may contain adapter weights
     # Note: ranknum doesn't need to be included as it is not an nn.Module
@@ -367,6 +370,10 @@ class RankAllocator:
             rank_pattern = self.mask_to_budget(model, budget)
         else:
             rank_pattern = None
+
+        if self.peft_config.orthonormalize:
+            gram_schmidt_orthonormalize_model(model)
+
         return budget, rank_pattern
 
     def mask_using_rank_pattern(self, model, rank_pattern):

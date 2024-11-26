@@ -50,6 +50,7 @@ class AdaLoraConfig(LoraConfig):
     rank_pattern: Optional[dict] = field(default=None, metadata={"help": "The saved rank pattern."})
 
     alternative_scoring: bool = field(default=False, metadata={"help": "Whether to use the alternative scoring scheme."})
+    orthonormalize: bool = field(default=False, metadata={"help": "Whether to enforce orthonormalization."})
 
     def __post_init__(self):
         super().__post_init__()
