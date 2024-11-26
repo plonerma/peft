@@ -211,8 +211,11 @@ class RankAllocator:
         self.reset_ipt()
         self._set_budget_scheduler(model)
 
-    def set_total_step(self, total_step):
-        self.peft_config.total_step = total_step
+    def track_metrics(self, metrics):
+        pass
+
+    def set_total_steps(self, total_steps, **kw):
+        self.peft_config.total_step = total_steps
 
     def reset_ipt(self):
         self.ipt = {}
@@ -252,7 +255,13 @@ class RankAllocator:
     def update_ipt(self, model):
         # Update the sensitivity and uncertainty for every weight
         for n, p in model.named_parameters():
-            if "lora_" in n and self.adapter_name in n:
+            if self.adapter_name not in n:
+                continue
+
+            if  (
+                (self.peft_config.alternative_scoring and "lora_E" in n)
+                or (not self.peft_config.alternative_scoring and "lora_" in n)
+            ):
                 if n not in self.ipt:
                     self.ipt[n] = torch.zeros_like(p)
                     self.exp_avg_ipt[n] = torch.zeros_like(p)
@@ -280,59 +289,75 @@ class RankAllocator:
         sum_ipt = ipt_E.view(-1) + ipt_AB.view(-1)
         return sum_ipt
 
-    def mask_to_budget(self, model, budget):
-        value_ipt = {}
-        vector_ipt = {}
-        triplet_ipt = {}
+    def retrieve_scores(self, model):
+        value_ipt: dict[str, torch.Tensor] = {}
+
+        if not self.alternative_scoring:
+            vector_ipt: dict[str, torch.Tensor] = {}
+
         # Get the importance score for A, E, B
-        for n, p in model.named_parameters():
-            if f"lora_A.{self.adapter_name}" in n:
-                entry_ipt = self._element_score(n)
-                comb_ipt = torch.mean(entry_ipt, dim=1, keepdim=True)
-                name_m = n.replace("lora_A", "%s")
-                if name_m not in vector_ipt:
-                    vector_ipt[name_m] = [comb_ipt]
-                else:
-                    vector_ipt[name_m].append(comb_ipt)
-            if f"lora_B.{self.adapter_name}" in n:
-                entry_ipt = self._element_score(n)
-                comb_ipt = torch.mean(entry_ipt, dim=0, keepdim=False).view(-1, 1)
-                name_m = n.replace("lora_B", "%s")
-                if name_m not in vector_ipt:
-                    vector_ipt[name_m] = [comb_ipt]
-                else:
-                    vector_ipt[name_m].append(comb_ipt)
+        for n, _ in model.named_parameters():
+            if not self.alternative_scoring:
+                if f"lora_A.{self.adapter_name}" in n:
+                    entry_ipt = self._element_score(n)
+                    comb_ipt = torch.mean(entry_ipt, dim=1, keepdim=True)
+                    name_m = n.replace("lora_A", "%s")
+                    if name_m not in vector_ipt:
+                        vector_ipt[name_m] = [comb_ipt]
+                    else:
+                        vector_ipt[name_m].append(comb_ipt)
+                if f"lora_B.{self.adapter_name}" in n:
+                    entry_ipt = self._element_score(n)
+                    comb_ipt = torch.mean(entry_ipt, dim=0, keepdim=False).view(-1, 1)
+                    name_m = n.replace("lora_B", "%s")
+                    if name_m not in vector_ipt:
+                        vector_ipt[name_m] = [comb_ipt]
+                    else:
+                        vector_ipt[name_m].append(comb_ipt)
+
             if f"lora_E.{self.adapter_name}" in n:
                 entry_ipt = self._element_score(n)
                 name_m = n.replace("lora_E", "%s")
                 value_ipt[name_m] = entry_ipt
 
-        all_score = []
-        # Calculate the score for each triplet
-        for name_m in vector_ipt:
-            ipt_E = value_ipt[name_m]
-            ipt_AB = torch.cat(vector_ipt[name_m], dim=1)
-            sum_ipt = self._combine_ipt(ipt_E, ipt_AB)
-            name_E = name_m % "lora_E"
-            triplet_ipt[name_E] = sum_ipt.view(-1, 1)
-            all_score.append(sum_ipt.view(-1))
+        module_scores: dict[str, torch.Tensor]
+        if not self.alternative_scoring:
+            module_scores = {}
+            for name_m in vector_ipt:
+                ipt_E = value_ipt[name_m]
+                ipt_AB = torch.cat(vector_ipt[name_m], dim=1)
+                sum_ipt = self._combine_ipt(ipt_E, ipt_AB)
+                name_E = name_m % "lora_E"
+                module_scores[name_E] = sum_ipt.view(-1)
+        else:
+            module_scores = {n % "lora_E": v.view(-1) for n, v in value_ipt.items()}
+
+        return module_scores
+
+    def mask_to_budget(self, model, budget):
+        module_scores = self.retrieve_scores(model)
+
+        all_scores = torch.cat(list(module_scores.values()))
 
         # Get the threshold by ranking ipt
         mask_threshold = torch.kthvalue(
-            torch.cat(all_score),
+            all_scores,
             k=self.init_bgt - budget,
         )[0].item()
 
         rank_pattern = {}
+
         # Mask the unimportant triplets
         with torch.no_grad():
             for n, p in model.named_parameters():
                 if f"lora_E.{self.adapter_name}" in n:
-                    p.masked_fill_(triplet_ipt[n] <= mask_threshold, 0.0)
-                    rank_pattern[n] = (~(triplet_ipt[n] <= mask_threshold)).view(-1).tolist()
+                    pattern = (module_scores[n] >= mask_threshold)
+                    p.masked_fill_(~pattern.unsqueeze(-1), 0.0)
+                    rank_pattern[n] = pattern.tolist()
+
         return rank_pattern
 
-    def update_and_allocate(self, model, global_step, force_mask=False):
+    def update_and_allocate(self, model, global_step, force_mask=False, **kw):
         # # Update the importance score and allocate the budget
         if global_step < self.peft_config.total_step - self.peft_config.tfinal:
             self.update_ipt(model)
@@ -354,5 +379,6 @@ class RankAllocator:
             for n, p in model.named_parameters():
                 if f"lora_E.{self.adapter_name}" in n:
                     key = n if not is_adapter_name_truncated else n.replace(f".{self.adapter_name}", "")
-                    mask = torch.Tensor(rank_pattern[key]).unsqueeze(-1).to(p.device)
-                    p.masked_fill_(~mask.bool(), 0.0)
+                    pattern = torch.Tensor(rank_pattern[key]).bool().to(p.device)
+                    p.masked_fill_(~pattern.unsqueeze(-1), 0.0)
+
