@@ -43,7 +43,7 @@ def iter_vectors(
 
 
 def gram_schmidt_orthonormalize_parameters(
-    params: torch.nn.ParameterList, *, normalize: bool = True, dim: int = 0
+    params: Union[torch.nn.Parameter, torch.nn.Parameter], *, normalize: bool = True, dim: int = 0
 ):
     """Run Gram-Schmidt orthogonalization process and normalize."""
 
@@ -53,7 +53,7 @@ def gram_schmidt_orthonormalize_parameters(
     for i, (param_index, vector_index, vector) in enumerate(
         iter_vectors(params, dim=dim, yield_indices=True)
     ):
-        offset = 0
+        #offset = 0
 
         v = vector
 
@@ -66,9 +66,9 @@ def gram_schmidt_orthonormalize_parameters(
             if not normalize:
                 proj /= torch.dot(vj, vj)
 
-            offset += proj
+            v -= proj
 
-        v -= offset
+        #v -= offset
 
         if normalize:
             length = torch.dot(v, v).sqrt()
