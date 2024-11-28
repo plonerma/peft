@@ -22,6 +22,7 @@ from peft.tuners.tuners_utils import BaseTunerLayer
 from peft.utils import (
     TRANSFORMERS_MODELS_TO_ADALORA_TARGET_MODULES_MAPPING,
     _freeze_adapter,
+    _get_submodules,
 )
 from peft.utils.integrations import gather_params_ctx
 
@@ -58,9 +59,8 @@ class IncreLoraModel(LoraModel):
     """
 
     # Note: don't redefine prefix here, it should be inherited from LoraModel
-
-    def __init__(self, model, config, adapter_name):
-        super().__init__(model, config, adapter_name)
+    def __init__(self, model, config, adapter_name, low_cpu_mem_usage: bool = False) -> None:
+        super().__init__(model, config, adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
 
         traininable_mode_counter = 0
         for config in self.peft_config.values():
@@ -109,7 +109,9 @@ class IncreLoraModel(LoraModel):
         current_key,
     ):
         kwargs = {
-            "r": lora_config.init_r,
+            "init_r": lora_config.init_r,
+            "reserve_ranks": lora_config.reserve_ranks,
+            "alternative_scoring": lora_config.alternative_scoring,
             "lora_alpha": lora_config.lora_alpha,
             "lora_dropout": lora_config.lora_dropout,
             "fan_in_fan_out": lora_config.fan_in_fan_out,
@@ -222,3 +224,65 @@ class IncreLoraModel(LoraModel):
     def add_weighted_adapter(self, *args, **kwargs):
         """This method is not supported for IncreLoRA, use LoRA instead."""
         raise TypeError(f"{self.__class__.__name__} does not support add_weighted_adapter method.")
+
+    def resize_modules_by_rank_pattern(self, *, adapter_name, rank_pattern):
+        lora_config = self.peft_config[adapter_name]
+
+        if rank_pattern is None:
+            rank_pattern = lora_config.rank_pattern
+
+        for name, pattern in rank_pattern.items():
+            if not isinstance(pattern, list):
+                raise ValueError("Unexpected type of is_reserve_rank")
+
+            parts = name.split(".")
+
+            if adapter_name in parts:
+                parts = parts[:-1]
+
+            if parts[0] == "model":
+                parts = parts[1:]
+
+            key = ".".join(parts)
+            _, target, _ = _get_submodules(self.model, key)
+
+            lora_E_weights = target.lora_E[adapter_name]
+            lora_A_weights = target.lora_A[adapter_name]
+            lora_B_weights = target.lora_B[adapter_name]
+
+            target.update_layer(
+                adapter_name,
+                lora_config.init_r,
+                lora_config.lora_alpha,
+                lora_config.lora_dropout,
+                lora_config.init_lora_weights,
+            )
+
+            add_r = len(pattern)
+
+            if lora_config.init_r > 0:
+                add_r -= 1
+                print("rp", pattern)
+                print("!", lora_config.init_r, sum(pattern))
+                ranknum = lora_config.init_r + sum(pattern) - 1
+            else:
+                ranknum = sum(pattern)
+            print("=", ranknum)
+
+            target.add_reserve_ranks(adapter_name, add_r)
+
+            with torch.no_grad():
+                target.lora_E[adapter_name][0].copy_(lora_E_weights[0])
+                target.lora_A[adapter_name][0].copy_(lora_A_weights[0])
+                target.lora_B[adapter_name][0].copy_(lora_B_weights[0])
+
+            target.r[adapter_name] = ranknum
+            target.rank_pattern[adapter_name] = pattern
+
+    def get_rank_pattern(self, adapter_name: str):
+        rank_pattern: dict[str, list[bool]] = {}
+        for n, layer in self.named_modules():
+            if isinstance(layer, SVDLinear):
+                rank_pattern[n] = layer.rank_pattern[adapter_name]
+
+        return rank_pattern

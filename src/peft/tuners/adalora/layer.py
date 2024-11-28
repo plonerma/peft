@@ -295,12 +295,12 @@ class RankAllocator:
     def retrieve_scores(self, model):
         value_ipt: dict[str, torch.Tensor] = {}
 
-        if not self.alternative_scoring:
+        if not self.peft_config.alternative_scoring:
             vector_ipt: dict[str, torch.Tensor] = {}
 
         # Get the importance score for A, E, B
         for n, _ in model.named_parameters():
-            if not self.alternative_scoring:
+            if not self.peft_config.alternative_scoring:
                 if f"lora_A.{self.adapter_name}" in n:
                     entry_ipt = self._element_score(n)
                     comb_ipt = torch.mean(entry_ipt, dim=1, keepdim=True)
@@ -324,7 +324,7 @@ class RankAllocator:
                 value_ipt[name_m] = entry_ipt
 
         module_scores: dict[str, torch.Tensor]
-        if not self.alternative_scoring:
+        if not self.peft_config.alternative_scoring:
             module_scores = {}
             for name_m in vector_ipt:
                 ipt_E = value_ipt[name_m]

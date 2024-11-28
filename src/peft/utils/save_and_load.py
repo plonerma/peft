@@ -103,6 +103,9 @@ def get_peft_model_state_dict(
                 config.rank_pattern = rank_pattern
                 to_return = model.resize_state_dict_by_rank_pattern(rank_pattern, to_return, adapter_name)
 
+        elif config.peft_type == PeftType.INCRELORA:
+            config.rank_pattern = model.get_rank_pattern(adapter_name)
+
         if config.use_dora:
             # Here we take care of a refactor of DoRA which changed lora_magnitude_vector from a ParameterDict to a
             # ModuleDict with a DoraLayer instance. The old parameter is now the "weight" attribute of that layer. Since
@@ -314,10 +317,12 @@ def _insert_adapter_name_into_state_dict(
     peft_model_state_dict = {}
     for key, val in state_dict.items():
         if parameter_prefix in key:
-            suffix = key.split(parameter_prefix)[1]
+            parent_name, suffix = key.split(parameter_prefix, 1)
+
             if "." in suffix:
-                suffix_to_replace = ".".join(suffix.split(".")[1:])
-                key = key.replace(suffix_to_replace, f"{adapter_name}.{suffix_to_replace}")
+                module_suffix, sub_param = suffix.split(".", 1)
+
+                key = f"{parent_name}{parameter_prefix}{module_suffix}.{adapter_name}.{sub_param}"
             else:
                 key = f"{key}.{adapter_name}"
             peft_model_state_dict[key] = val
@@ -398,10 +403,10 @@ def set_peft_model_state_dict(
             state_dict, adapter_name=adapter_name, parameter_prefix=parameter_prefix
         )
 
-        if config.peft_type == PeftType.ADALORA:
+        if config.peft_type in (PeftType.ADALORA, PeftType.INCRELORA):
             rank_pattern = config.rank_pattern
             if rank_pattern is not None:
-                model.resize_modules_by_rank_pattern(rank_pattern, adapter_name)
+                model.resize_modules_by_rank_pattern(rank_pattern=rank_pattern, adapter_name=adapter_name)
         elif config.peft_type == PeftType.VERA:
             if config.save_projection and "base_model.vera_A" not in peft_model_state_dict:
                 raise ValueError(

@@ -37,14 +37,18 @@ class IncreLoraLayer(LoraLayer):
         "lora_embedding_B",
     )
     # All names of other parameters that may contain adapter-related parameters
-    other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout", "ranknum")
+    other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout", "rank_pattern")
+
+
+    rank_pattern: dict[str, list[bool]]
 
     def __init__(self, base_layer: nn.Module) -> None:
         super().__init__(base_layer)
         self.lora_E = nn.ModuleDict({})
         self.lora_A = nn.ModuleDict({})
         self.lora_B = nn.ModuleDict({})
-        self.ranknum = nn.ParameterDict({})
+
+        self.rank_pattern = {}
 
     def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
         self.r[adapter_name] = r
@@ -62,13 +66,16 @@ class IncreLoraLayer(LoraLayer):
         self.lora_E[adapter_name] = nn.ParameterList([])
         self.lora_B[adapter_name] = nn.ParameterList([])
 
+
+        self.rank_pattern[adapter_name] = []
+
         if r > 0:
             self.lora_A[adapter_name].append(nn.Parameter(torch.randn(r, self.in_features)))
             self.lora_E[adapter_name].append(nn.Parameter(torch.randn(r, 1)))
             self.lora_B[adapter_name].append(nn.Parameter(torch.randn(self.out_features, r)))
+            self.rank_pattern[adapter_name].append(True)
 
         # The current rank
-        self.ranknum[adapter_name] = nn.Parameter(torch.tensor([float(r)]), requires_grad=False)
         self.scaling[adapter_name] = lora_alpha if lora_alpha > 0 else float(r)
         if init_lora_weights:
             self.reset_lora_parameters(adapter_name)
@@ -82,20 +89,22 @@ class IncreLoraLayer(LoraLayer):
                 nn.init.zeros_(p)
 
             for p in chain(self.lora_A[adapter_name], self.lora_B[adapter_name]):
-                nn.init.normal_(p, mean=0.0, std=0.02)
+                nn.init.normal_(p)
 
 
 class SVDLinear(nn.Module, IncreLoraLayer):
-    # SVD-based adaptation by a dense layer
+
     def __init__(
         self,
         base_layer: nn.Module,
         adapter_name: str,
-        r: int = 0,
+        init_r: int = 0,
+        reserve_ranks: int = 0,
         lora_alpha: int = 1,
         lora_dropout: float = 0.0,
         fan_in_fan_out: bool = False,
         init_lora_weights: bool = True,
+        alternative_scoring: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -105,7 +114,11 @@ class SVDLinear(nn.Module, IncreLoraLayer):
 
         self.fan_in_fan_out = fan_in_fan_out
         self._active_adapter = adapter_name
-        self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
+
+        self.alternative_scoring = alternative_scoring
+
+        self.update_layer(adapter_name, init_r, lora_alpha, lora_dropout, init_lora_weights)
+        self.add_reserve_ranks(adapter_name, reserve_ranks)
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
         """
@@ -163,12 +176,16 @@ class SVDLinear(nn.Module, IncreLoraLayer):
         return (
             transpose(lora_B @ (lora_A * lora_E), self.fan_in_fan_out)
             * self.scaling[adapter]
-            / (self.ranknum[adapter] + 1e-5)
+            / max(self.r[adapter], 1)
         )
 
-    def backward_hook(self, w, grad):
+    def backward_hook(self, w, grad, apply_sum=False):
         # scale_W = torch.mean(W)
-        self.score = torch.sum((w * grad).abs().detach()) / math.sqrt(w.numel())
+        score = (w * grad).abs().detach()
+        if not self.alternative_scoring:
+            self.score = (torch.sum(score) / math.sqrt(w.numel())).view(-1)
+        else:
+            self.score = score.view(-1)
         # self.score = torch.mean((grad_Matrix ** 2).detach())
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
@@ -187,41 +204,58 @@ class SVDLinear(nn.Module, IncreLoraLayer):
                 dropout = self.lora_dropout[active_adapter]
                 x = x.to(self.lora_A[active_adapter][0].dtype)
 
-                if self.training:
-                    w = self.get_delta_weight(active_adapter)
-                    w.register_hook(partial(self.backward_hook, w))
-                    result += dropout(x) @ w.T
-                else:
-                    lora_A = torch.cat(tuple(self.lora_A[active_adapter]), 0)
-                    lora_B = torch.cat(tuple(self.lora_B[active_adapter]), 1)
-                    lora_E = torch.cat(tuple(self.lora_E[active_adapter]), 0)
 
-                    scaling = self.scaling[active_adapter]
-                    ranknum = self.ranknum[active_adapter] + 1e-5
-                    result += (dropout(x) @ (lora_A * lora_E).T @ lora_B.T) * scaling / ranknum
+                if self.training:
+                    if not self.alternative_scoring and torch.is_grad_enabled():
+                        w = self.get_delta_weight(active_adapter)
+                        w.requires_grad_(True)
+                        w.register_hook(partial(self.backward_hook, w))
+                        result += dropout(x) @ w.T
+                    else:
+                        lora_A = torch.cat(list(self.lora_A[active_adapter]), 0)
+                        lora_B = torch.cat(list(self.lora_B[active_adapter]), 1)
+                        lora_E = torch.cat(list(self.lora_E[active_adapter]), 0)
+
+                        if torch.is_grad_enabled():
+                            lora_E.register_hook(partial(self.backward_hook, lora_E))
+
+                        scaling = self.scaling[active_adapter]
+                        ranknum = max(self.r[active_adapter], 1)
+                        result += (dropout(x) @ (lora_A * lora_E).T @ lora_B.T) * scaling / ranknum
+                else:
+                    rank_pattern = self.rank_pattern.get(active_adapter, [])
+                    if any(rank_pattern):
+                        lora_A = torch.cat([rank for rank, use in zip(self.lora_A[active_adapter], rank_pattern) if use], 0)
+                        lora_B = torch.cat([rank for rank, use in zip(self.lora_B[active_adapter], rank_pattern) if use], 1)
+                        lora_E = torch.cat([rank for rank, use in zip(self.lora_E[active_adapter], rank_pattern) if use], 0)
+
+                        scaling = self.scaling[active_adapter]
+                        ranknum = max(self.r[active_adapter], 1)
+                        result += (dropout(x) @ (lora_A * lora_E).T @ lora_B.T) * scaling / ranknum
+
+
         return result
 
     def __repr__(self) -> str:
         rep = super().__repr__()
         return "increlora." + rep
 
-    def add_reserve_ranks(self, adapter_name, add_r, grad_e: bool = False) -> list[nn.Parameter]:
+    def add_reserve_ranks(self, adapter_name, add_r) -> list[nn.Parameter]:
         parameters: list[nn.Parameter] = []
         for _ in range(add_r):
             e = nn.Parameter(
-                self.weight.new_zeros(1, 1),
-                # if alternative_scoring is used the parameter is not trained,
-                # but the the gradient is still requiered
-                requires_grad=grad_e,
+                self.weight.new_full((1, 1), 1e-6),
+                requires_grad=False,
             )
-            a = nn.Parameter(self.weight.new_zeros((1, self.in_features)), requires_grad=True)
-            b = nn.Parameter(self.weight.new_zeros((self.out_features, 1)), requires_grad=True)
-            e[0][0] = 1e-5
-            nn.init.normal_(a, mean=0.0, std=0.02)
-            nn.init.normal_(b, mean=0.0, std=0.02)
+            a = nn.Parameter(self.weight.new_empty((1, self.in_features)), requires_grad=True)
+            b = nn.Parameter(self.weight.new_empty((self.out_features, 1)), requires_grad=True)
+            nn.init.normal_(a)
+            nn.init.normal_(b)
             self.lora_E[adapter_name].append(e)
             self.lora_A[adapter_name].append(a)
             self.lora_B[adapter_name].append(b)
+
+            self.rank_pattern[adapter_name].append(False)
 
             parameters.extend((a, b))
         return parameters

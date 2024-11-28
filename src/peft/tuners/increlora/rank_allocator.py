@@ -17,15 +17,7 @@ import math
 from functools import partial
 from typing import Callable, Union
 
-import packaging
 import torch
-import transformers
-
-
-if packaging.version.parse(transformers.__version__) >= packaging.version.parse("4.33.0"):
-    from transformers.integrations import deepspeed_config
-else:
-    from transformers.deepspeed import deepspeed_config
 
 from ..adalora.gram_schmidt import gram_schmidt_orthonormalize_model
 from .config import IncreLoraConfig
@@ -46,7 +38,7 @@ class RankAllocator:
 
     """
 
-    current_total_rank: int
+    total_current_rank: int
     total_modules: int
     total_steps: int
 
@@ -111,7 +103,7 @@ class RankAllocator:
 
         for module in model.modules():
             if isinstance(module, SVDLinear):
-                new_params.extend(module.add_reserve_ranks(self.adapter_name, self.peft_config.reserve_ranks, grad_e=self.peft_config.alternative_scoring))
+                new_params.extend(module.add_reserve_ranks(self.adapter_name, self.peft_config.reserve_ranks))
 
         optimizer.add_param_group(
             {
@@ -119,6 +111,8 @@ class RankAllocator:
                 "weight_decay": self.weight_decay,
             }
         )
+
+        self.peft_config.rank_pattern = model.get_rank_pattern(self.adapter_name)
 
     def reset_ipt(self):
         self.ipt = {}
@@ -131,16 +125,11 @@ class RankAllocator:
             if not isinstance(layer, SVDLinear):
                 continue
 
-            if self.adapter_name not in n:
-                continue
-
-            if self.alternative_scoring:
-                if n not in self.ipt:
+            if n not in self.ipt:
+                if self.alternative_scoring:
                     zeros = partial(
                         torch.zeros,
                         len(layer.lora_E),
-                        dtype=layer.lora_E.dtype,
-                        device=layer.lora_E.device,
                         requires_grad=False,
                     )
 
@@ -148,38 +137,19 @@ class RankAllocator:
                     self.exp_avg_ipt[n] = zeros()
                     self.exp_avg_unc[n] = zeros()
 
-                with torch.no_grad():
-                    for i, p in enumerate(layer.lora_E[self.adapter_name]):
-                        if deepspeed_config() is not None:
-                            import deepspeed
-
-                            grad = deepspeed.utils.safe_get_full_grad(p)
-                        else:
-                            grad = p.grad
-                        # each param should only consist of a single entry/rank
-                        self.ipt[n][i] = (p * grad).abs().detach().mean(dim=0)
-
-                    # Sensitivity smoothing
-                    self.exp_avg_ipt[n] = self.beta1 * self.exp_avg_ipt[n] + (1 - self.beta1) * self.ipt[n]
-                    # Uncertainty quantification
-                    self.exp_avg_unc[n] = (
-                        self.beta2 * self.exp_avg_unc[n] + (1 - self.beta2) * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
-                    )
-
-            else:
-                if n not in self.ipt:
+                else:
                     self.ipt[n] = 0
                     self.exp_avg_ipt[n] = 0
                     self.exp_avg_unc[n] = 0
 
-                self.ipt[n] = layer.score
+            self.ipt[n] = layer.score
 
-                # Update sensitivity
-                self.exp_avg_ipt[n] = self.beta1 * self.exp_avg_ipt[n] + (1 - self.beta1) * self.ipt[n]
-                # Update uncertainty
-                self.exp_avg_unc[n] = (
-                    self.beta2 * self.exp_avg_unc[n] + (1 - self.beta2) * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
-                )
+            # Update sensitivity
+            self.exp_avg_ipt[n] = self.beta1 * self.exp_avg_ipt[n] + (1 - self.beta1) * self.ipt[n]
+            # Update uncertainty
+            self.exp_avg_unc[n] = (
+                self.beta2 * self.exp_avg_unc[n] + (1 - self.beta2) * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
+            )
 
     def retrieve_scores(self, model) -> dict[str, torch.Tensor]:
         module_scores: dict[str, torch.Tensor] = {}
@@ -189,10 +159,12 @@ class RankAllocator:
             if isinstance(layer, SVDLinear):
                 if self.alternative_scoring:
                     module_scores[n] = (
-                        self.exp_avg_ipt[n][-self.reserve_ranks :] * self.exp_avg_unc[n][-self.reserve_ranks :]
+                        self.exp_avg_ipt[n][-self.reserve_ranks:] * self.exp_avg_unc[n][-self.reserve_ranks:]
                     )
                 else:
                     module_scores[n] = self.exp_avg_ipt[n] * self.exp_avg_unc[n]
+
+        return module_scores
 
     def increase_layer_rank(self, layer: SVDLinear, ranks_to_add: Union[int, list[bool]]) -> list[torch.nn.Parameter]:
         """Add the selected ranks to the layer.
@@ -213,36 +185,37 @@ class RankAllocator:
         else:
             num_added = sum(ranks_to_add)
 
-        layer.ranknum += num_added
+        layer.r[self.adapter_name] += num_added
         self.total_current_rank += num_added
 
         new_paramters: list[torch.nn.Parameter] = []
 
         # Make the existing lora_E parameters trainable
-        for add, param_e in zip(ranks_to_add, layer.lora_E[self.adapter_name]):
+        for i, (add, param_e) in enumerate(zip(ranks_to_add, layer.lora_E[self.adapter_name])):
             if not add:
                 continue
             # Param already existed, but wasn't trained before
             param_e.requires_grad = True
             new_paramters.append(param_e)
+            layer.rank_pattern[self.adapter_name][i] = True
 
-        new_paramters.extend(layer.add_reserve_ranks(self.adapter_name, num_added, grad_e=self.peft_config.alternative_scoring))
+        new_paramters.extend(layer.add_reserve_ranks(self.adapter_name, num_added))
         return new_paramters
 
     def increase_to_target_rank(self, model, optimizer):
-        module_scores = self.retrieve_scores()
+        module_scores = self.retrieve_scores(model)
 
         metrics = {}
 
         # Calculate the increasing threshold
         if self.alternative_scoring:
-            k = min(self.top_h * self.reserve_ranks, self.total_target_rank - self.current_total_rank)
+            k = min(self.top_h * self.reserve_ranks, self.total_target_rank - self.total_current_rank)
         else:
-            k = min(self.top_h, self.total_target_rank - self.current_total_rank)
+            k = min(self.top_h, self.total_target_rank - self.total_current_rank)
 
         all_scores = torch.cat(list(module_scores.values()))
 
-        increase_threshold = torch.topk(torch.tensor(all_scores), k)[0][-1].item()
+        increase_threshold = torch.topk(all_scores, k)[0][-1].item()
 
         with torch.no_grad():
             new_param_list = []
@@ -266,10 +239,11 @@ class RankAllocator:
 
                     if num_added > 0:
                         self.increase_layer_rank(layer, ranks_to_add)
+                        self.peft_config.rank_pattern[n] = layer.rank_pattern
                         logger.info("The lora parameters rank of %s increased by %d", n, num_added)
 
                     # log metrics
-                    metrics[f"num_rank/{n}"] = layer.ranknum
+                    metrics[f"num_rank/{n}"] = layer.r[self.adapter_name]
 
             metrics["total_rank"] = self.total_current_rank
 
@@ -283,8 +257,7 @@ class RankAllocator:
             if self.total_current_rank == self.total_target_rank:
                 for module in model.modules():
                     if isinstance(module, SVDLinear):
-                        module.hook_handle.remove()
-                        for param in module.lora_E[-self.peft_config.reserve_ranks :]:
+                        for param in module.lora_E[self.adapter_name][-self.peft_config.reserve_ranks:]:
                             param.fill_(0.0)
 
             metrics["budget/total_rank"] = self.total_current_rank

@@ -61,7 +61,7 @@ class IncreLoraConfig(LoraConfig):
     beta2: float = field(default=0.85, metadata={"help": "Hyperparameter of EMA."})
     orth_reg_weight: float = field(default=0.5, metadata={"help": "The orthogonal regularization coefficient."})
     total_step: Optional[int] = field(default=None, metadata={"help": "The total training steps."})
-    rank_pattern: Optional[dict] = field(default=None, metadata={"help": "The saved rank pattern."})
+    rank_pattern: Optional[dict[str, list[bool]]] = field(default=None, metadata={"help": "The saved rank pattern."})
 
     def __post_init__(self):
         self.peft_type = PeftType.INCRELORA
