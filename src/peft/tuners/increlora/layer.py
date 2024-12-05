@@ -89,7 +89,7 @@ class IncreLoraLayer(LoraLayer):
                 nn.init.zeros_(p)
 
             for p in chain(self.lora_A[adapter_name], self.lora_B[adapter_name]):
-                nn.init.normal_(p)
+                nn.init.normal_(p, mean=0.0, std=0.02)
 
 
 class SVDLinear(nn.Module, IncreLoraLayer):
@@ -116,6 +116,8 @@ class SVDLinear(nn.Module, IncreLoraLayer):
         self._active_adapter = adapter_name
 
         self.alternative_scoring = alternative_scoring
+
+        self.hook_handle = None
 
         self.update_layer(adapter_name, init_r, lora_alpha, lora_dropout, init_lora_weights)
         self.add_reserve_ranks(adapter_name, reserve_ranks)
@@ -186,6 +188,9 @@ class SVDLinear(nn.Module, IncreLoraLayer):
             self.score = (torch.sum(score) / math.sqrt(w.numel())).view(-1)
         else:
             self.score = score.view(-1)
+
+        if self.hook_handle is not None:
+            self.hook_handle.remove()
         # self.score = torch.mean((grad_Matrix ** 2).detach())
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
@@ -209,7 +214,9 @@ class SVDLinear(nn.Module, IncreLoraLayer):
                     if not self.alternative_scoring and torch.is_grad_enabled():
                         w = self.get_delta_weight(active_adapter)
                         w.requires_grad_(True)
-                        w.register_hook(partial(self.backward_hook, w))
+                        if self.hook_handle is not None:
+                            self.hook_handle.remove()
+                        self.hook_handle = w.register_hook(partial(self.backward_hook, w))
                         result += dropout(x) @ w.T
                     else:
                         lora_A = torch.cat(list(self.lora_A[active_adapter]), 0)
@@ -249,8 +256,8 @@ class SVDLinear(nn.Module, IncreLoraLayer):
             )
             a = nn.Parameter(self.weight.new_empty((1, self.in_features)), requires_grad=True)
             b = nn.Parameter(self.weight.new_empty((self.out_features, 1)), requires_grad=True)
-            nn.init.normal_(a)
-            nn.init.normal_(b)
+            nn.init.normal_(a, mean=0.0, std=0.02)
+            nn.init.normal_(b, mean=0.0, std=0.02)
             self.lora_E[adapter_name].append(e)
             self.lora_A[adapter_name].append(a)
             self.lora_B[adapter_name].append(b)

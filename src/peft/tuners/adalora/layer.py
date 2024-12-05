@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import warnings
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 import packaging
 import torch
@@ -203,11 +203,12 @@ class RankAllocator:
 
     """
 
-    def __init__(self, model, peft_config, adapter_name):
+    def __init__(self, model, peft_config, adapter_name, track_metrics: Callable = lambda _: None):
         self.peft_config = peft_config
         self.adapter_name = adapter_name
         self.beta1 = peft_config.beta1
         self.beta2 = peft_config.beta2
+        self.track_metrics = track_metrics
         assert self.beta1 > 0 and self.beta1 < 1
         assert self.beta2 > 0 and self.beta2 < 1
 
@@ -360,7 +361,7 @@ class RankAllocator:
 
         return rank_pattern
 
-    def update_and_allocate(self, model, global_step, force_mask=False, **kw):
+    def update_and_allocate(self, model, global_step, training_args, force_mask=False, **kw):
         # # Update the importance score and allocate the budget
         if global_step < self.peft_config.total_step - self.peft_config.tfinal:
             self.update_ipt(model)
@@ -373,6 +374,34 @@ class RankAllocator:
 
         if self.peft_config.orthonormalize:
             gram_schmidt_orthonormalize_model(model)
+
+        if global_step % training_args.logging_steps == 0:
+            metrics = {}
+
+            if rank_pattern is not None:
+                metrics = {"traing/avg_rank": sum(sum(pattern) for pattern in rank_pattern.values()) / len(rank_pattern)}
+
+            def compute_and_log(mat_cov, name):
+                I = torch.eye(*mat_cov.size(), out=torch.empty_like(mat_cov))
+                I.requires_grad = False
+                orth_regu = torch.norm(mat_cov - I, p="fro")
+                regu_loss.append(orth_regu.item())
+                metrics[f"Orth_regu_loss/{name}"] = orth_regu.item()
+
+            with torch.no_grad():
+                regu_loss = []
+                for n, layer in model.named_modules():
+                    if isinstance(layer, SVDLinear):
+                        wA = layer.lora_A[self.adapter_name]
+                        wB = layer.lora_B[self.adapter_name]
+                        mat_cov_A = wA @ wA.T
+                        mat_cov_B = wB.T @ wB
+                        compute_and_log(mat_cov_A, n + ".lora_A")
+                        compute_and_log(mat_cov_B, n + ".lora_B")
+
+                metrics["train/orth_regu_loss"] = sum(regu_loss) / len(regu_loss)
+
+            self.track_metrics(metrics)
 
         return budget, rank_pattern
 

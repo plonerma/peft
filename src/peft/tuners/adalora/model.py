@@ -235,36 +235,6 @@ class AdaLoraModel(LoraModel):
                 raise
             return getattr(self.model, name)
 
-    def forward(self, *args, **kwargs):
-        outputs = self.model.forward(*args, **kwargs)
-
-        if (getattr(outputs, "loss", None) is not None) and isinstance(outputs.loss, torch.Tensor):
-            # Calculate the orthogonal regularization
-            orth_reg_weight = self.peft_config[self.trainable_adapter_name].orth_reg_weight
-
-            if orth_reg_weight <= 0:
-                raise ValueError("orth_reg_weight should be greater than 0. ")
-
-            regu_loss = 0
-            num_param = 0
-            for n, p in self.model.named_parameters():
-                if ("lora_A" in n or "lora_B" in n) and self.trainable_adapter_name in n:
-                    if p.shape == torch.Size([0]):
-                        with gather_params_ctx(p, fwd_module=self):
-                            para_cov = p @ p.T if "lora_A" in n else p.T @ p
-                    else:
-                        para_cov = p @ p.T if "lora_A" in n else p.T @ p
-                    I = torch.eye(*para_cov.size(), out=torch.empty_like(para_cov))  # noqa: E741
-                    I.requires_grad = False
-                    num_param += 1
-                    regu_loss += torch.norm(para_cov - I, p="fro")
-            if num_param > 0:
-                regu_loss = regu_loss / num_param
-            else:
-                regu_loss = 0
-            outputs.loss += orth_reg_weight * regu_loss
-        return outputs
-
     def resize_modules_by_rank_pattern(self, rank_pattern, adapter_name):
         lora_config = self.peft_config[adapter_name]
         for name, rank_idx in rank_pattern.items():

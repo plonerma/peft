@@ -125,31 +125,29 @@ class RankAllocator:
             if not isinstance(layer, SVDLinear):
                 continue
 
-            if n not in self.ipt:
-                if self.alternative_scoring:
-                    zeros = partial(
-                        torch.zeros,
-                        len(layer.lora_E),
-                        requires_grad=False,
-                    )
-
-                    self.ipt[n] = zeros()
-                    self.exp_avg_ipt[n] = zeros()
-                    self.exp_avg_unc[n] = zeros()
-
-                else:
-                    self.ipt[n] = 0
-                    self.exp_avg_ipt[n] = 0
-                    self.exp_avg_unc[n] = 0
-
             self.ipt[n] = layer.score
 
-            # Update sensitivity
-            self.exp_avg_ipt[n] = self.beta1 * self.exp_avg_ipt[n] + (1 - self.beta1) * self.ipt[n]
-            # Update uncertainty
-            self.exp_avg_unc[n] = (
-                self.beta2 * self.exp_avg_unc[n] + (1 - self.beta2) * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
-            )
+            if n not in self.exp_avg_ipt:
+                self.exp_avg_ipt[n] = self.ipt[n]
+            else:
+                self.exp_avg_ipt[n] = self.beta1 * self.exp_avg_ipt[n] + (1 - self.beta1) * self.ipt[n][:self.exp_avg_ipt[n].size(0)]
+
+                r_added = self.ipt[n].size(0) > self.exp_avg_ipt[n].size(0)
+
+                if r_added:
+                    # Size changed, expand with ipt values at that position
+                    self.exp_avg_ipt[n] = torch.cat([self.exp_avg_ipt[n], self.ipt[n][self.exp_avg_ipt[n].size(0):]])
+
+                unc = (self.ipt[n] - self.exp_avg_ipt[n]).abs()
+
+                if n not in self.exp_avg_unc:
+                    self.exp_avg_unc[n] = unc
+                else:
+                    self.exp_avg_unc[n] = (
+                        self.beta2 * self.exp_avg_unc[n] + (1 - self.beta2) * unc[:self.exp_avg_unc[n].size(0)]
+                    )
+                    if r_added:
+                        self.exp_avg_unc[n] = torch.cat([self.exp_avg_unc[n], unc[self.exp_avg_unc[n].size(0):]])
 
     def retrieve_scores(self, model) -> dict[str, torch.Tensor]:
         module_scores: dict[str, torch.Tensor] = {}
@@ -245,7 +243,6 @@ class RankAllocator:
                     # log metrics
                     metrics[f"num_rank/{n}"] = layer.r[self.adapter_name]
 
-            metrics["total_rank"] = self.total_current_rank
 
             optimizer.add_param_group(
                 {
@@ -261,6 +258,7 @@ class RankAllocator:
                             param.fill_(0.0)
 
             metrics["budget/total_rank"] = self.total_current_rank
+            metrics["budget/avg_rank"] = self.total_current_rank / self.total_modules
             metrics["budget/increase_threshold"] = increase_threshold
 
             self.track_metrics(metrics)
@@ -279,16 +277,16 @@ class RankAllocator:
         if self.peft_config.orthonormalize:
             gram_schmidt_orthonormalize_model(model)
 
-        metrics = {}
+        if global_step % training_args.logging_steps == 0:
+            metrics = {}
 
-        def compute_and_log(mat_cov, name):
-            I = torch.eye(*mat_cov.size(), out=torch.empty_like(mat_cov))
-            I.requires_grad = False
-            orth_regu = torch.norm(mat_cov - I, p="fro")
-            regu_loss.append(orth_regu.item())
-            metrics[f"Orth_regu_loss/{name}"] = orth_regu.item()
+            def compute_and_log(mat_cov, name):
+                I = torch.eye(*mat_cov.size(), out=torch.empty_like(mat_cov))
+                I.requires_grad = False
+                orth_regu = torch.norm(mat_cov - I, p="fro")
+                regu_loss.append(orth_regu.item())
+                metrics[f"Orth_regu_loss/{name}"] = orth_regu.item()
 
-        if global_step % 250 == 0:
             with torch.no_grad():
                 regu_loss = []
                 for n, layer in model.named_modules():
