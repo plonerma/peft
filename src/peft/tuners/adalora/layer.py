@@ -208,6 +208,9 @@ class RankAllocator:
         self.adapter_name = adapter_name
         self.beta1 = peft_config.beta1
         self.beta2 = peft_config.beta2
+
+        self.rank_pattern = None
+
         self.track_metrics = track_metrics
         assert self.beta1 > 0 and self.beta1 < 1
         assert self.beta2 > 0 and self.beta2 < 1
@@ -368,9 +371,9 @@ class RankAllocator:
         budget, mask_ind = self.budget_schedule(global_step)
         # Allocate the budget according to importance scores
         if mask_ind or force_mask:
-            rank_pattern = self.mask_to_budget(model, budget)
-        else:
-            rank_pattern = None
+            self.rank_pattern = self.mask_to_budget(model, budget)
+        elif self.rank_pattern is not None:
+            self.mask_using_rank_pattern(model, self.rank_pattern)
 
         if self.peft_config.orthonormalize:
             gram_schmidt_orthonormalize_model(model)
@@ -378,8 +381,8 @@ class RankAllocator:
         if global_step % training_args.logging_steps == 0:
             metrics = {}
 
-            if rank_pattern is not None:
-                metrics = {"traing/avg_rank": sum(sum(pattern) for pattern in rank_pattern.values()) / len(rank_pattern)}
+            if self.rank_pattern is not None:
+                metrics = {"traing/avg_rank": sum(sum(pattern) for pattern in self.rank_pattern.values()) / len(self.rank_pattern)}
 
             def compute_and_log(mat_cov, name):
                 I = torch.eye(*mat_cov.size(), out=torch.empty_like(mat_cov))
@@ -403,9 +406,12 @@ class RankAllocator:
 
             self.track_metrics(metrics)
 
-        return budget, rank_pattern
+        return budget, self.rank_pattern
 
-    def mask_using_rank_pattern(self, model, rank_pattern):
+    def mask_using_rank_pattern(self, model, rank_pattern=None):
+        if rank_pattern is None:
+            rank_pattern = self.rank_pattern
+
         # Mask the unimportant triplets
         is_adapter_name_truncated = False
         if self.adapter_name not in next(iter(rank_pattern.keys())):

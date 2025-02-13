@@ -14,7 +14,6 @@
 
 import logging
 import math
-from functools import partial
 from typing import Callable, Union
 
 import torch
@@ -66,7 +65,7 @@ class RankAllocator:
 
     @property
     def top_h(self):
-        return self.peft_config.top_h
+        return self.peft_config.num_top_modules
 
     @property
     def reserve_ranks(self):
@@ -90,7 +89,7 @@ class RankAllocator:
 
         num_rounds = math.ceil(total_additional_rank / rank_per_round)
 
-        total_incre_step = self.peft_config.deltaT * num_rounds
+        total_incre_step = self.peft_config.growth_interval * num_rounds
 
         logger.info(
             "Total incremental step: total_incre_step: %d, of total steps: %.2f (%d modules)",
@@ -104,6 +103,7 @@ class RankAllocator:
         for module in model.modules():
             if isinstance(module, SVDLinear):
                 new_params.extend(module.add_reserve_ranks(self.adapter_name, self.peft_config.reserve_ranks))
+                module._move_adapter_to_device_of_base_layer(self.adapter_name)
 
         optimizer.add_param_group(
             {
@@ -156,8 +156,9 @@ class RankAllocator:
         for n, layer in model.named_modules():
             if isinstance(layer, SVDLinear):
                 if self.alternative_scoring:
+                    reserve = [not r for r in layer.rank_pattern[self.adapter_name]]
                     module_scores[n] = (
-                        self.exp_avg_ipt[n][-self.reserve_ranks:] * self.exp_avg_unc[n][-self.reserve_ranks:]
+                        self.exp_avg_ipt[n][reserve] * self.exp_avg_unc[n][reserve]
                     )
                 else:
                     module_scores[n] = self.exp_avg_ipt[n] * self.exp_avg_unc[n]
@@ -175,11 +176,12 @@ class RankAllocator:
         Returns:
             The parameters that need to be added to the optimizer.
         """
+        lora_E = layer.lora_E[self.adapter_name]
 
         num_added: int
         if isinstance(ranks_to_add, int):
             num_added = ranks_to_add
-            ranks_to_add = [True] * ranks_to_add
+            ranks_to_add = [False] * (len(lora_E) - ranks_to_add) + [True]*ranks_to_add
         else:
             num_added = sum(ranks_to_add)
 
@@ -188,11 +190,22 @@ class RankAllocator:
 
         new_paramters: list[torch.nn.Parameter] = []
 
+        assert len(ranks_to_add) == len(lora_E)
+        assert len(layer.rank_pattern[self.adapter_name]) == len(lora_E)
+
+        #print(layer.rank_pattern[self.adapter_name])
+        #print(ranks_to_add)
+        #print([p.requires_grad for p in lora_E])
+
         # Make the existing lora_E parameters trainable
-        for i, (add, param_e) in enumerate(zip(ranks_to_add, layer.lora_E[self.adapter_name])):
+        for i, (add, param_e) in enumerate(zip(ranks_to_add, lora_E)):
             if not add:
                 continue
+            print(i)
             # Param already existed, but wasn't trained before
+            assert not layer.rank_pattern[self.adapter_name][i]
+            assert not param_e.requires_grad
+
             param_e.requires_grad = True
             new_paramters.append(param_e)
             layer.rank_pattern[self.adapter_name][i] = True
@@ -209,11 +222,16 @@ class RankAllocator:
         if self.alternative_scoring:
             k = min(self.top_h * self.reserve_ranks, self.total_target_rank - self.total_current_rank)
         else:
-            k = min(self.top_h, self.total_target_rank - self.total_current_rank)
+            k = min(self.top_h, (self.total_target_rank - self.total_current_rank) // self.reserve_ranks)
+
+        if not k > 0:
+            return float("Inf")
 
         all_scores = torch.cat(list(module_scores.values()))
 
-        increase_threshold = torch.topk(all_scores, k)[0][-1].item()
+        values, _ = torch.topk(all_scores, k)
+        increase_threshold = values[-1].item()
+
 
         with torch.no_grad():
             new_param_list = []
@@ -221,13 +239,16 @@ class RankAllocator:
                 if isinstance(layer, SVDLinear):
                     num_added: int = 0
                     if self.alternative_scoring:
+                        # one booelan per reserve rank
                         ranks_to_add = (module_scores[n] >= increase_threshold).tolist()
 
                         if any(ranks_to_add):
-                            num_prev_params = len(layer.lora_E[self.adapter_name]) - len(ranks_to_add)
+                            # map the reserve rank flags to flags for the complete list of params
+                            add_rank = iter(ranks_to_add)
 
-                            # fill up the mask
-                            ranks_to_add = [False] * num_prev_params + ranks_to_add
+                            ranks_to_add = [
+                                (not p) and next(add_rank) for p in layer.rank_pattern[self.adapter_name]
+                            ]
 
                             num_added = sum(ranks_to_add)
 
@@ -268,9 +289,10 @@ class RankAllocator:
     def update_and_allocate(self, model, global_step, optimizer, training_args, **kw):
         if self.total_current_rank < self.total_target_rank:
             self.update_ipt(model)
+            warmup_steps = training_args.get_warmup_steps(self.total_steps)
             if (
-                global_step > training_args.get_warmup_steps(self.total_steps)  # warmup complete
-                and global_step % self.peft_config.deltaT == 0  # at growth step
+                global_step >= warmup_steps  # warmup complete
+                and (global_step - warmup_steps) % self.peft_config.growth_interval == 0  # at growth step
             ):
                 self.increase_to_target_rank(model, optimizer)
 

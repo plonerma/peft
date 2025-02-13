@@ -70,9 +70,9 @@ class IncreLoraLayer(LoraLayer):
         self.rank_pattern[adapter_name] = []
 
         if r > 0:
-            self.lora_A[adapter_name].append(nn.Parameter(torch.randn(r, self.in_features)))
-            self.lora_E[adapter_name].append(nn.Parameter(torch.randn(r, 1)))
-            self.lora_B[adapter_name].append(nn.Parameter(torch.randn(self.out_features, r)))
+            self.lora_A[adapter_name].append(nn.Parameter(torch.empty(r, self.in_features)))
+            self.lora_E[adapter_name].append(nn.Parameter(torch.empty(r, 1)))
+            self.lora_B[adapter_name].append(nn.Parameter(torch.empty(self.out_features, r)))
             self.rank_pattern[adapter_name].append(True)
 
         # The current rank
@@ -120,7 +120,8 @@ class SVDLinear(nn.Module, IncreLoraLayer):
         self.hook_handle = None
 
         self.update_layer(adapter_name, init_r, lora_alpha, lora_dropout, init_lora_weights)
-        self.add_reserve_ranks(adapter_name, reserve_ranks)
+        #self.add_reserve_ranks(adapter_name, reserve_ranks)
+        #self._move_adapter_to_device_of_base_layer(adapter_name)
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
         """
@@ -181,11 +182,11 @@ class SVDLinear(nn.Module, IncreLoraLayer):
             / max(self.r[adapter], 1)
         )
 
-    def backward_hook(self, w, grad, apply_sum=False):
+    def backward_hook(self, param, grad, apply_sum=False):
         # scale_W = torch.mean(W)
-        score = (w * grad).abs().detach()
+        score = (param * grad).abs().detach()
         if not self.alternative_scoring:
-            self.score = (torch.sum(score) / math.sqrt(w.numel())).view(-1)
+            self.score = (torch.sum(score) / math.sqrt(param.numel())).view(-1)
         else:
             self.score = score.view(-1)
 
@@ -224,7 +225,8 @@ class SVDLinear(nn.Module, IncreLoraLayer):
                         lora_E = torch.cat(list(self.lora_E[active_adapter]), 0)
 
                         if torch.is_grad_enabled():
-                            lora_E.register_hook(partial(self.backward_hook, lora_E))
+                            lora_E.requires_grad_()
+                            self.hook_handle = lora_E.register_hook(partial(self.backward_hook, lora_E))
 
                         scaling = self.scaling[active_adapter]
                         ranknum = max(self.r[active_adapter], 1)

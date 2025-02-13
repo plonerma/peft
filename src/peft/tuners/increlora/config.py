@@ -37,9 +37,10 @@ class IncreLoraConfig(LoraConfig):
     target_r: int = field(default=8, metadata={"help": "Target Lora matrix dimension."})
     init_r: int = field(default=12, metadata={"help": "Initial Lora matrix dimension."})
 
-    deltaT: int = field(default=1000, metadata={"help": "The time internval between two budget allocations."})
+    growth_interval: int = field(default=1000, metadata={"help": "The time internval between two budget allocations."})
 
-    top_h: int = field(default=5, metadata={"help": "The number of modules selected."})
+    num_top_modules: int = field(default=5, metadata={"help": "The number of modules selected."})
+
     reserve_ranks: int = field(
         default=1,
         metadata={
