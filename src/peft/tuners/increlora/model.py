@@ -24,7 +24,6 @@ from peft.utils import (
     _freeze_adapter,
     _get_submodules,
 )
-from peft.utils.integrations import gather_params_ctx
 
 from .layer import IncreLoraLayer, SVDLinear
 
@@ -137,6 +136,7 @@ class IncreLoraModel(LoraModel):
                 lora_config.lora_dropout,
                 lora_config.init_lora_weights,
             )
+            target.alternative_scoring = lora_config.alternative_scoring
 
     @staticmethod
     def _create_new_module(lora_config, adapter_name, target, **kwargs):
@@ -231,12 +231,9 @@ class IncreLoraModel(LoraModel):
 
             if lora_config.init_r > 0:
                 add_r -= 1
-                print("rp", pattern)
-                print("!", lora_config.init_r, sum(pattern))
                 ranknum = lora_config.init_r + sum(pattern) - 1
             else:
                 ranknum = sum(pattern)
-            print("=", ranknum)
 
             target.add_reserve_ranks(adapter_name, add_r)
 
@@ -255,3 +252,12 @@ class IncreLoraModel(LoraModel):
                 rank_pattern[n] = layer.rank_pattern[adapter_name]
 
         return rank_pattern
+
+    def setup_reserve_ranks(self):
+        new_params = []
+
+        for module in self.modules():
+            if isinstance(module, SVDLinear):
+                new_params.extend(module.add_reserve_ranks(self.trainable_adapter_name, self.peft_config[self.trainable_adapter_name].reserve_ranks))
+                module._move_adapter_to_device_of_base_layer(self.trainable_adapter_name)
+        return new_params

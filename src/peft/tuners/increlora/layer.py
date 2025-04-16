@@ -39,7 +39,6 @@ class IncreLoraLayer(LoraLayer):
     # All names of other parameters that may contain adapter-related parameters
     other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout", "rank_pattern")
 
-
     rank_pattern: dict[str, list[bool]]
 
     def __init__(self, base_layer: nn.Module) -> None:
@@ -65,7 +64,6 @@ class IncreLoraLayer(LoraLayer):
         self.lora_A[adapter_name] = nn.ParameterList([])
         self.lora_E[adapter_name] = nn.ParameterList([])
         self.lora_B[adapter_name] = nn.ParameterList([])
-
 
         self.rank_pattern[adapter_name] = []
 
@@ -93,6 +91,7 @@ class IncreLoraLayer(LoraLayer):
 
 
 class SVDLinear(nn.Module, IncreLoraLayer):
+    EPS = 1e-5
 
     def __init__(
         self,
@@ -120,8 +119,8 @@ class SVDLinear(nn.Module, IncreLoraLayer):
         self.hook_handle = None
 
         self.update_layer(adapter_name, init_r, lora_alpha, lora_dropout, init_lora_weights)
-        #self.add_reserve_ranks(adapter_name, reserve_ranks)
-        #self._move_adapter_to_device_of_base_layer(adapter_name)
+        # self.add_reserve_ranks(adapter_name, reserve_ranks)
+        # self._move_adapter_to_device_of_base_layer(adapter_name)
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
         """
@@ -184,10 +183,11 @@ class SVDLinear(nn.Module, IncreLoraLayer):
 
     def backward_hook(self, param, grad, apply_sum=False):
         # scale_W = torch.mean(W)
-        score = (param * grad).abs().detach()
         if not self.alternative_scoring:
+            score = (param * grad).abs().detach()
             self.score = (torch.sum(score) / math.sqrt(param.numel())).view(-1)
         else:
+            score = (grad).abs().detach()
             self.score = score.view(-1)
 
         if self.hook_handle is not None:
@@ -210,14 +210,14 @@ class SVDLinear(nn.Module, IncreLoraLayer):
                 dropout = self.lora_dropout[active_adapter]
                 x = x.to(self.lora_A[active_adapter][0].dtype)
 
-
                 if self.training:
-                    if not self.alternative_scoring and torch.is_grad_enabled():
+                    if not self.alternative_scoring:
                         w = self.get_delta_weight(active_adapter)
-                        w.requires_grad_(True)
-                        if self.hook_handle is not None:
-                            self.hook_handle.remove()
-                        self.hook_handle = w.register_hook(partial(self.backward_hook, w))
+                        if torch.is_grad_enabled():
+                            if self.hook_handle is not None:
+                                self.hook_handle.remove()
+                            w.requires_grad_(True)
+                            self.hook_handle = w.register_hook(partial(self.backward_hook, w))
                         result += dropout(x) @ w.T
                     else:
                         lora_A = torch.cat(list(self.lora_A[active_adapter]), 0)
@@ -225,23 +225,31 @@ class SVDLinear(nn.Module, IncreLoraLayer):
                         lora_E = torch.cat(list(self.lora_E[active_adapter]), 0)
 
                         if torch.is_grad_enabled():
-                            lora_E.requires_grad_()
+                            # Note that this enables the gradient for the intermediate variable (concatenated Es, not the leaf parameters)
+                            if self.hook_handle is not None:
+                                self.hook_handle.remove()
+                            lora_E.requires_grad_(True)
                             self.hook_handle = lora_E.register_hook(partial(self.backward_hook, lora_E))
 
                         scaling = self.scaling[active_adapter]
                         ranknum = max(self.r[active_adapter], 1)
                         result += (dropout(x) @ (lora_A * lora_E).T @ lora_B.T) * scaling / ranknum
                 else:
-                    rank_pattern = self.rank_pattern.get(active_adapter, [])
+                    rank_pattern = self.rank_pattern[active_adapter]
                     if any(rank_pattern):
-                        lora_A = torch.cat([rank for rank, use in zip(self.lora_A[active_adapter], rank_pattern) if use], 0)
-                        lora_B = torch.cat([rank for rank, use in zip(self.lora_B[active_adapter], rank_pattern) if use], 1)
-                        lora_E = torch.cat([rank for rank, use in zip(self.lora_E[active_adapter], rank_pattern) if use], 0)
+                        lora_A = torch.cat(
+                            [rank for rank, use in zip(self.lora_A[active_adapter], rank_pattern) if use], 0
+                        )
+                        lora_B = torch.cat(
+                            [rank for rank, use in zip(self.lora_B[active_adapter], rank_pattern) if use], 1
+                        )
+                        lora_E = torch.cat(
+                            [rank for rank, use in zip(self.lora_E[active_adapter], rank_pattern) if use], 0
+                        )
 
                         scaling = self.scaling[active_adapter]
                         ranknum = max(self.r[active_adapter], 1)
                         result += (dropout(x) @ (lora_A * lora_E).T @ lora_B.T) * scaling / ranknum
-
 
         return result
 
@@ -253,7 +261,7 @@ class SVDLinear(nn.Module, IncreLoraLayer):
         parameters: list[nn.Parameter] = []
         for _ in range(add_r):
             e = nn.Parameter(
-                self.weight.new_full((1, 1), 1e-6),
+                self.weight.new_full((1, 1), self.EPS),
                 requires_grad=False,
             )
             a = nn.Parameter(self.weight.new_empty((1, self.in_features)), requires_grad=True)
@@ -268,3 +276,22 @@ class SVDLinear(nn.Module, IncreLoraLayer):
 
             parameters.extend((a, b))
         return parameters
+
+    def get_reserve_mask(self, adapter_name):
+        return torch.cat([
+            torch.full((e.size(0), ), not r)
+            for r, e in zip(self.rank_pattern[adapter_name], self.lora_E[adapter_name])
+        ])
+
+    def get_rank(self, adapter_name, *, include_reserve=False) -> int:
+        return sum((
+            e.size(0)
+            for r, e in zip(self.rank_pattern[adapter_name], self.lora_E[adapter_name])
+            if r or include_reserve
+        ))
+
+    def drop_reserve(self, adapter_name):
+        self.lora_A[adapter_name] = torch.nn.ParameterList([a for r, a in zip(self.rank_pattern[adapter_name], self.lora_A[adapter_name]) if r])
+        self.lora_B[adapter_name] = torch.nn.ParameterList([b for r, b in zip(self.rank_pattern[adapter_name], self.lora_B[adapter_name]) if r])
+        self.lora_E[adapter_name] = torch.nn.ParameterList([e for r, e in zip(self.rank_pattern[adapter_name], self.lora_E[adapter_name]) if r])
+
