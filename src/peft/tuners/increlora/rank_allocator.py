@@ -120,7 +120,6 @@ class RankAllocator:
             if not isinstance(layer, SVDLinear):
                 continue
 
-            print(n, n in self.ipt, n in self.exp_avg_ipt, n in self.exp_avg_unc)
             self.ipt[n] = layer.score
 
             if n not in self.exp_avg_ipt:
