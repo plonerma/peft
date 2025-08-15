@@ -14,7 +14,7 @@
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Literal
 
 from peft.tuners.lora import LoraConfig
 from peft.utils import PeftType
@@ -55,6 +55,11 @@ class IncreLoraConfig(LoraConfig):
         default=False, metadata={"help": "Whether to use the alternative scoring scheme."}
     )
     orthonormalize: bool = field(default=False, metadata={"help": "Whether to enforce orthonormalization."})
+    dynamic_scaling: bool = field(default=True, metadata={"help": "Whether to scale adapter contribution based on current rank (instead of target_r)."})
+
+    init_lora_weights: (
+        Literal["lora", "increlora"]
+    ) = "increlora"
 
     tinit: int = field(default=0, metadata={"help": "The steps of initial warmup."})
     tfinal: int = field(default=0, metadata={"help": "The steps of final warmup."})

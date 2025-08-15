@@ -76,18 +76,30 @@ class IncreLoraLayer(LoraLayer):
         # The current rank
         self.scaling[adapter_name] = lora_alpha if lora_alpha > 0 else float(r)
         if init_lora_weights:
-            self.reset_lora_parameters(adapter_name)
+            self.reset_lora_parameters(adapter_name, init_lora_weights)
 
         self._move_adapter_to_device_of_base_layer(adapter_name)
         self.set_adapter(self.active_adapters)
 
-    def reset_lora_parameters(self, adapter_name):
-        if adapter_name in self.lora_A.keys():
-            for p in self.lora_E[adapter_name]:
-                nn.init.zeros_(p)
+    def reset_lora_parameters(self, adapter_name, init_lora_weights):
+        if init_lora_weights.lower() == "increlora":
+            if adapter_name in self.lora_A.keys():
+                for p in self.lora_E[adapter_name]:
+                    nn.init.zeros_(p)
 
-            for p in chain(self.lora_A[adapter_name], self.lora_B[adapter_name]):
-                nn.init.normal_(p, mean=0.0, std=0.02)
+                for p in chain(self.lora_A[adapter_name], self.lora_B[adapter_name]):
+
+                    nn.init.normal_(p, mean=0.0, std=0.02)
+        else:
+            if adapter_name in self.lora_A.keys():
+                for p in self.lora_E[adapter_name]:
+                    nn.init.ones_(p)
+
+                for p in self.lora_A[adapter_name]:
+                    nn.init.kaiming_uniform_(p, a=math.sqrt(5))
+
+                for p in self.lora_B[adapter_name]:
+                    nn.init.zeros_(p)
 
 
 class SVDLinear(nn.Module, IncreLoraLayer):
@@ -98,12 +110,14 @@ class SVDLinear(nn.Module, IncreLoraLayer):
         base_layer: nn.Module,
         adapter_name: str,
         init_r: int = 0,
+        target_r: int = 0,
         reserve_ranks: int = 0,
         lora_alpha: int = 1,
         lora_dropout: float = 0.0,
         fan_in_fan_out: bool = False,
         init_lora_weights: bool = True,
         alternative_scoring: bool = False,
+        dynamic_scaling: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -115,6 +129,8 @@ class SVDLinear(nn.Module, IncreLoraLayer):
         self._active_adapter = adapter_name
 
         self.alternative_scoring = alternative_scoring
+        self.dynamic_scaling = dynamic_scaling
+        self.target_r = target_r
 
         self.hook_handle = None
 
@@ -171,14 +187,19 @@ class SVDLinear(nn.Module, IncreLoraLayer):
             if active_adapter in self.lora_A.keys():
                 self.get_base_layer().weight.data -= self.get_delta_weight(active_adapter)
 
+    def get_scaling_coeff(self, adapter) -> float:
+        if self.dynamic_scaling:
+            return self.scaling[adapter]  / max(self.r[adapter], 1)
+        else:
+            return self.scaling[adapter] / self.target_r
+
     def get_delta_weight(self, adapter) -> torch.Tensor:
         lora_A = torch.cat(tuple(self.lora_A[adapter]), 0)
         lora_B = torch.cat(tuple(self.lora_B[adapter]), 1)
         lora_E = torch.cat(tuple(self.lora_E[adapter]), 0)
         return (
             transpose(lora_B @ (lora_A * lora_E), self.fan_in_fan_out)
-            * self.scaling[adapter]
-            / max(self.r[adapter], 1)
+            * self.get_scaling_coeff(adapter)
         )
 
     def backward_hook(self, param, grad, apply_sum=False):
@@ -231,9 +252,7 @@ class SVDLinear(nn.Module, IncreLoraLayer):
                             lora_E.requires_grad_(True)
                             self.hook_handle = lora_E.register_hook(partial(self.backward_hook, lora_E))
 
-                        scaling = self.scaling[active_adapter]
-                        ranknum = max(self.r[active_adapter], 1)
-                        result += (dropout(x) @ (lora_A * lora_E).T @ lora_B.T) * scaling / ranknum
+                        result += (dropout(x) @ (lora_A * lora_E).T @ lora_B.T) * self.get_scaling_coeff(active_adapter)
                 else:
                     rank_pattern = self.rank_pattern[active_adapter]
                     if any(rank_pattern):
@@ -247,9 +266,7 @@ class SVDLinear(nn.Module, IncreLoraLayer):
                             [rank for rank, use in zip(self.lora_E[active_adapter], rank_pattern) if use], 0
                         )
 
-                        scaling = self.scaling[active_adapter]
-                        ranknum = max(self.r[active_adapter], 1)
-                        result += (dropout(x) @ (lora_A * lora_E).T @ lora_B.T) * scaling / ranknum
+                        result += (dropout(x) @ (lora_A * lora_E).T @ lora_B.T) * self.get_scaling_coeff(active_adapter)
 
         return result
 

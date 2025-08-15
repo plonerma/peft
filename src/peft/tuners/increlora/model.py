@@ -111,6 +111,7 @@ class IncreLoraModel(LoraModel):
             "init_r": lora_config.init_r,
             "reserve_ranks": lora_config.reserve_ranks,
             "alternative_scoring": lora_config.alternative_scoring,
+            "dynamic_scaling": lora_config.dynamic_scaling,
             "lora_alpha": lora_config.lora_alpha,
             "lora_dropout": lora_config.lora_dropout,
             "fan_in_fan_out": lora_config.fan_in_fan_out,
@@ -137,6 +138,7 @@ class IncreLoraModel(LoraModel):
                 lora_config.init_lora_weights,
             )
             target.alternative_scoring = lora_config.alternative_scoring
+            target.dynamic_scaling = lora_config.dynamic_scaling
 
     @staticmethod
     def _create_new_module(lora_config, adapter_name, target, **kwargs):
