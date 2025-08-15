@@ -76,7 +76,7 @@ def get_peft_model_state_dict(
         state_dict = model.state_dict()
 
     # TUNER SPECIFIC CODE
-    if config.peft_type in (PeftType.LORA, PeftType.ADALORA, PeftType.INCRELORA):
+    if config.peft_type in (PeftType.LORA, PeftType.ADALORA, PeftType.INCRELORA, PeftType.GROWRA):
         # to_return = lora_state_dict(model, bias=model.peft_config.bias)
         # adapted from `https://github.com/microsoft/LoRA/blob/main/loralib/utils.py`
         # to be used directly with the state dict which is necessary when using DeepSpeed or FSDP
@@ -103,7 +103,7 @@ def get_peft_model_state_dict(
                 config.rank_pattern = rank_pattern
                 to_return = model.resize_state_dict_by_rank_pattern(rank_pattern, to_return, adapter_name)
 
-        elif config.peft_type == PeftType.INCRELORA:
+        elif config.peft_type in (PeftType.INCRELORA, PeftType.GROWRA):
             config.rank_pattern = model.get_rank_pattern(adapter_name)
 
         if config.use_dora:
@@ -403,7 +403,7 @@ def set_peft_model_state_dict(
             state_dict, adapter_name=adapter_name, parameter_prefix=parameter_prefix
         )
 
-        if config.peft_type in (PeftType.ADALORA, PeftType.INCRELORA):
+        if config.peft_type in (PeftType.ADALORA, PeftType.INCRELORA, PeftType.GROWRA):
             rank_pattern = config.rank_pattern
             if rank_pattern is not None:
                 model.resize_modules_by_rank_pattern(rank_pattern=rank_pattern, adapter_name=adapter_name)

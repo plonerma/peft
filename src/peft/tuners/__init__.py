@@ -32,6 +32,7 @@ from .lokr import LoKrConfig, LoKrModel
 from .ia3 import IA3Config, IA3Model
 from .adalora import AdaLoraConfig, AdaLoraModel
 from .increlora import IncreLoraConfig, IncreLoraModel
+from .growra import GrowRAConfig, GrowRAModel
 from .boft import BOFTConfig, BOFTModel
 from .p_tuning import PromptEncoder, PromptEncoderConfig, PromptEncoderReparameterizationType
 from .prefix_tuning import PrefixEncoder, PrefixTuningConfig

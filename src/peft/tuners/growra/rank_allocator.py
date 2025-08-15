@@ -1,0 +1,313 @@
+# Copyright 2023-present the HuggingFace Inc. team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import math
+from typing import Callable
+
+import torch
+
+from ..adalora.gram_schmidt import gram_schmidt_orthonormalize_model
+from .config import GrowRAConfig
+from .layer import SVDLinear
+from .model import GrowRAModel
+
+
+logger = logging.getLogger(__name__)
+
+
+class RankAllocator:
+    """
+    The RankAllocator for GrowRAModel. Paper: https://arxiv.org/abs/2308.12043
+
+    Args:
+        config ([`GrowRAConfig`]): The configuration of the GrowRA model.
+        model: the model that we apply IncreLoRA to.
+
+    """
+
+    total_current_rank: int
+    total_modules: int
+    total_steps: int
+
+    def __init__(
+        self,
+        model: GrowRAModel,
+        peft_config: GrowRAConfig,
+        adapter_name: str,
+        track_metrics: Callable = lambda _: None,
+    ):
+        self.peft_config = peft_config
+        self.adapter_name = adapter_name
+        self.beta1 = peft_config.beta1
+        self.beta2 = peft_config.beta2
+        self.track_metrics = track_metrics
+        assert self.beta1 > 0 and self.beta1 < 1
+        assert self.beta2 > 0 and self.beta2 < 1
+
+        self.reset_ipt()
+
+    @property
+    def total_target_rank(self) -> int:
+        return self.peft_config.target_r * self.total_modules
+
+    @property
+    def top_h(self):
+        return self.peft_config.num_top_modules
+
+    @property
+    def reserve_ranks(self):
+        return self.peft_config.reserve_ranks
+
+    def setup(self, *, total_steps, optimizer, model, weight_decay):
+        total_modules: int = 0
+        for layer in model.modules():
+            if isinstance(layer, SVDLinear):
+                total_modules += 1
+
+        self.total_steps = total_steps
+        self.total_modules = total_modules
+        self.total_current_rank = total_modules * self.peft_config.init_r
+
+        self.weight_decay = weight_decay
+
+        rank_per_round = self.top_h * self.reserve_ranks
+
+        total_additional_rank = self.total_modules * (self.peft_config.target_r - self.peft_config.init_r)
+
+        num_rounds = math.ceil(total_additional_rank / rank_per_round)
+
+        total_incre_step = self.peft_config.growth_interval * num_rounds
+
+        logger.info(
+            "Total incremental step: total_incre_step: %d, of total steps: %.2f (%d modules)",
+            total_incre_step,
+            total_incre_step / total_steps,
+            self.total_modules,
+        )
+
+        new_params = model.setup_reserve_ranks()
+
+        optimizer.add_param_group(
+            {
+                "params": new_params,
+                "weight_decay": self.weight_decay,
+            }
+        )
+
+        self.peft_config.rank_pattern = model.get_rank_pattern(self.adapter_name)
+
+    def reset_ipt(self):
+        self.ipt = {}
+        self.exp_avg_ipt = {}
+        self.exp_avg_unc = {}
+
+    def update_ipt(self, model):
+        # Update the sensitivity and uncertainty for every weight
+        for n, layer in model.named_modules():
+            if not isinstance(layer, SVDLinear):
+                continue
+
+            self.ipt[n] = layer.score
+
+            if n not in self.exp_avg_ipt:
+                self.exp_avg_ipt[n] = self.ipt[n]
+            else:
+                self.exp_avg_ipt[n] = (
+                    self.beta1 * self.exp_avg_ipt[n] + (1 - self.beta1) * self.ipt[n][: self.exp_avg_ipt[n].size(0)]
+                )
+
+                r_added = self.ipt[n].size(0) > self.exp_avg_ipt[n].size(0)
+
+                if r_added:
+                    # Size changed, expand with ipt values at that position
+                    self.exp_avg_ipt[n] = torch.cat([self.exp_avg_ipt[n], self.ipt[n][self.exp_avg_ipt[n].size(0) :]])
+
+                unc = (self.ipt[n] - self.exp_avg_ipt[n]).abs()
+
+                if n not in self.exp_avg_unc:
+                    self.exp_avg_unc[n] = unc
+                else:
+                    self.exp_avg_unc[n] = (
+                        self.beta2 * self.exp_avg_unc[n] + (1 - self.beta2) * unc[: self.exp_avg_unc[n].size(0)]
+                    )
+                    if r_added:
+                        self.exp_avg_unc[n] = torch.cat([self.exp_avg_unc[n], unc[self.exp_avg_unc[n].size(0) :]])
+
+    def retrieve_scores(self, model) -> dict[str, torch.Tensor]:
+        module_scores: dict[str, torch.Tensor] = {}
+
+        # Calculate the importance score for each sub matrix
+        for n, layer in model.named_modules():
+            if isinstance(layer, SVDLinear):
+                reserve = layer.get_reserve_mask(self.adapter_name)
+                module_scores[n] = self.exp_avg_ipt[n][reserve] * self.exp_avg_unc[n][reserve]
+
+
+        return module_scores
+
+    def increase_layer_rank(self, layer: SVDLinear, ranks_to_add: list[bool]) -> list[torch.nn.Parameter]:
+        """Add the selected ranks to the layer.
+
+        Args:
+            ranks_to_add: specifies either the number of ranks to add
+            (i.e. all reserve ranks from the back of the parameter list)
+            or a boolean mask specifying which ranks to add.
+
+        Returns:
+            The parameters that need to be added to the optimizer.
+        """
+        lora_E = layer.lora_E[self.adapter_name]
+
+        num_added: int = sum(ranks_to_add)
+
+        layer.r[self.adapter_name] += num_added
+        self.total_current_rank += num_added
+
+        new_paramters: list[torch.nn.Parameter] = []
+
+        assert len(ranks_to_add) == len(lora_E)
+        assert len(layer.rank_pattern[self.adapter_name]) == len(lora_E)
+
+        # print(layer.rank_pattern[self.adapter_name])
+        # print(ranks_to_add)
+        # print([p.requires_grad for p in lora_E])
+
+        # Make the existing lora_E parameters trainable
+        for i, (add, param_e) in enumerate(zip(ranks_to_add, lora_E)):
+            if not add:
+                continue
+            # Param already existed, but wasn't trained before
+            assert not layer.rank_pattern[self.adapter_name][i]
+            assert not param_e.requires_grad
+
+            param_e.requires_grad = True
+            new_paramters.append(param_e)
+            layer.rank_pattern[self.adapter_name][i] = True
+
+        new_paramters.extend(layer.add_reserve_ranks(self.adapter_name, num_added))
+        return new_paramters
+
+    def increase_to_target_rank(self, model, optimizer):
+        module_scores = self.retrieve_scores(model)
+
+        metrics = {}
+
+        # Calculate the increasing threshold
+        k = min(self.top_h * self.reserve_ranks, self.total_target_rank - self.total_current_rank)
+
+
+        if not k > 0:
+            return float("Inf")
+
+        all_scores = torch.cat(list(module_scores.values()))
+
+        values, _ = torch.topk(all_scores, k)
+        increase_threshold = values[-1].item()
+
+        with torch.no_grad():
+            new_param_list = []
+            for n, layer in model.named_modules():
+                if isinstance(layer, SVDLinear):
+                    num_added: int = 0
+                    ranks_to_add: list[bool]
+
+                    # one booelan per reserve rank
+                    ranks_to_add = (module_scores[n] >= increase_threshold).tolist()
+
+                    if any(ranks_to_add):
+                        # map the reserve rank flags to flags for the complete list of params
+                        add_rank = iter(ranks_to_add)
+
+                        # next(add_rank) is only called if the current rank is a reserve rank
+                        # otherwise, the iterator is not progressed (as we only have ranks_to_add
+                        # values for the reserve ranks)
+                        ranks_to_add = [(not p) and next(add_rank) for p in layer.rank_pattern[self.adapter_name]]
+
+                        num_added = sum(ranks_to_add)
+
+                    if num_added > 0:
+                        new_param_list.extend(self.increase_layer_rank(layer, ranks_to_add))
+                        self.peft_config.rank_pattern[n] = layer.rank_pattern
+                        logger.info("The lora parameters rank of %s increased by %d", n, num_added)
+
+                    # log metrics
+                    metrics[f"num_rank/{n}"] = layer.r[self.adapter_name]
+
+            optimizer.add_param_group(
+                {
+                    "params": new_param_list,
+                    "weight_decay": self.weight_decay,
+                }
+            )
+
+            if self.total_current_rank == self.total_target_rank:
+                # Disable advance learning
+                for layer in model.modules():
+                    if isinstance(layer, SVDLinear):
+                        for i, is_regular in enumerate(layer.rank_pattern):
+                            if not is_regular:
+                                layer.lora_E[self.adapter_name].fill_(0.0)
+                                layer.lora_E[self.adapter_name].requires_grad = False
+                                layer.lora_A[self.adapter_name].fill_(0.0)
+                                layer.lora_A[self.adapter_name].requires_grad = False
+                                layer.lora_B[self.adapter_name].fill_(0.0)
+                                layer.lora_B[self.adapter_name].requires_grad = False
+
+            metrics["budget/total_rank"] = self.total_current_rank
+            metrics["budget/avg_rank"] = self.total_current_rank / self.total_modules
+            metrics["budget/increase_threshold"] = increase_threshold
+
+            self.track_metrics(metrics)
+
+        return increase_threshold
+
+    def update_and_allocate(self, model, global_step, optimizer, training_args, **kw):
+        if self.total_current_rank < self.total_target_rank:
+            self.update_ipt(model)
+            warmup_steps = training_args.get_warmup_steps(self.total_steps)
+            if (
+                global_step >= 2  # At least 2 steps to initialize ipt score, uncertainty, etc.
+                and global_step >= warmup_steps  # warmup complete
+                and (global_step - warmup_steps) % self.peft_config.growth_interval == 0  # at growth step
+            ):
+                self.increase_to_target_rank(model, optimizer)
+
+        if self.peft_config.orthonormalize:
+            gram_schmidt_orthonormalize_model(model)
+
+        if global_step % training_args.logging_steps == 0:
+            metrics = {}
+
+            def compute_and_log(mat_cov, name):
+                I = torch.eye(*mat_cov.size(), out=torch.empty_like(mat_cov))
+                I.requires_grad = False
+                orth_regu = torch.norm(mat_cov - I, p="fro")
+                regu_loss.append(orth_regu.item())
+                metrics[f"Orth_regu_loss/{name}"] = orth_regu.item()
+
+            with torch.no_grad():
+                regu_loss = []
+                for n, layer in model.named_modules():
+                    if isinstance(layer, SVDLinear):
+                        wA = torch.cat(list(layer.lora_A[self.adapter_name]), 0)
+                        wB = torch.cat(list(layer.lora_B[self.adapter_name]), 1)
+                        mat_cov_A = wA @ wA.T
+                        mat_cov_B = wB.T @ wB
+                        compute_and_log(mat_cov_A, n + ".lora_A")
+                        compute_and_log(mat_cov_B, n + ".lora_B")
+
+                metrics["train/orth_regu_loss"] = sum(regu_loss) / len(regu_loss)
+
+            self.track_metrics(metrics)

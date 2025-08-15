@@ -65,6 +65,8 @@ from .tuners import (
     AdaLoraModel,
     IncreLoraConfig,
     IncreLoraModel,
+    GrowRAConfig,
+    GrowRAModel,
     BOFTConfig,
     BOFTModel,
     PrefixEncoder,

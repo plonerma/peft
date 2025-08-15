@@ -291,6 +291,7 @@ PEFT_TYPE_TO_PREFIX_MAPPING = {
     PeftType.LORA: "lora_",
     PeftType.ADALORA: "lora_",
     PeftType.INCRELORA: "lora_",
+    PeftType.GROWRA: "lora_",
     PeftType.LOHA: "hada_",
     PeftType.LOKR: "lokr_",
     PeftType.OFT: "oft_",
