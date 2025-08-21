@@ -37,7 +37,7 @@ class IncreLoraLayer(LoraLayer):
         "lora_embedding_B",
     )
     # All names of other parameters that may contain adapter-related parameters
-    other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout", "rank_pattern")
+    other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout", "rank_pattern", "target_r")
 
     rank_pattern: dict[str, list[bool]]
 
@@ -48,10 +48,12 @@ class IncreLoraLayer(LoraLayer):
         self.lora_B = nn.ModuleDict({})
 
         self.rank_pattern = {}
+        self.target_r = {}
 
-    def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
+    def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, target_r):
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
+        self.target_r[adapter_name] = target_r
 
         if lora_dropout > 0.0:
             lora_dropout_layer = nn.Dropout(p=lora_dropout)
@@ -130,11 +132,10 @@ class SVDLinear(nn.Module, IncreLoraLayer):
 
         self.alternative_scoring = alternative_scoring
         self.dynamic_scaling = dynamic_scaling
-        self.target_r = target_r
 
         self.hook_handle = None
 
-        self.update_layer(adapter_name, init_r, lora_alpha, lora_dropout, init_lora_weights)
+        self.update_layer(adapter_name, init_r, lora_alpha, lora_dropout, init_lora_weights, target_r)
         # self.add_reserve_ranks(adapter_name, reserve_ranks)
         # self._move_adapter_to_device_of_base_layer(adapter_name)
 
@@ -191,7 +192,7 @@ class SVDLinear(nn.Module, IncreLoraLayer):
         if self.dynamic_scaling:
             return self.scaling[adapter]  / max(self.r[adapter], 1)
         else:
-            return self.scaling[adapter] / self.target_r
+            return self.scaling[adapter] / self.target_r[adapter]
 
     def get_delta_weight(self, adapter) -> torch.Tensor:
         lora_A = torch.cat(tuple(self.lora_A[adapter]), 0)

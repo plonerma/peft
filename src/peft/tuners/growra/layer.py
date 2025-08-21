@@ -37,7 +37,7 @@ class GrowRALayer(LoraLayer):
         "lora_embedding_B",
     )
     # All names of other parameters that may contain adapter-related parameters
-    other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout", "rank_pattern")
+    other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout", "rank_pattern", "target_r")
 
     rank_pattern: dict[str, list[bool]]
 
@@ -48,10 +48,12 @@ class GrowRALayer(LoraLayer):
         self.lora_B = nn.ModuleDict({})
 
         self.rank_pattern = {}
+        self.target_r = {}
 
-    def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
+    def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, target_r):
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
+        self.target_r[adapter_name] = target_r
 
         if lora_dropout > 0.0:
             lora_dropout_layer = nn.Dropout(p=lora_dropout)
@@ -108,9 +110,9 @@ class GrowRAComputation(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, A, B, e, reserve):
         # Only include non-reserve in the computation
-        pre_B = torch.einsum("...i,ri,r->...r", input, A, e.squeeze(-1))
+        pre_B = torch.einsum("...i,ri,r->...r", input, A[~reserve, ...], e[~reserve].squeeze(-1))
 
-        z = torch.einsum("...r,or->...o", pre_B[..., ~reserve], B[..., ~reserve])
+        z = torch.einsum("...r,or->...o", pre_B, B[..., ~reserve])
 
         ctx.save_for_backward(input, pre_B, A, B, e, reserve)
 
@@ -121,20 +123,36 @@ class GrowRAComputation(torch.autograd.Function):
     def backward(ctx, grad_output):
         input, pre_B, A, B, e, reserve = ctx.saved_tensors
 
+        device = grad_output.device
+        dtype = grad_output.dtype
+
+        input = input.to(dtype=dtype)
+        pre_B = pre_B.to(dtype=dtype)
+        A = A.to(dtype=dtype)
+        B = B.to(dtype=dtype)
+        e = e.to(dtype=dtype)
+
         # o: index along output dimension
         # r: index along ranks
         # i: index along input dimension
-        grad_B = torch.einsum("...o,...r->or", grad_output, pre_B.to(dtype=grad_output.dtype))
+        grad_B = torch.empty(B.shape, dtype=grad_output.dtype, device=device)
 
-        grad_pre_B = torch.einsum("...o,or->...r", grad_output, B.to(dtype=grad_output.dtype))
+        # In the reserve, the magnitude is ignored to not scale down the gradient while in the already added ranks, the magnitude is used
+        grad_B[..., ~reserve] = torch.einsum("...o,...r->or", grad_output, pre_B)
+        grad_B[...,  reserve] = torch.einsum("...o,...i,...ri->or", grad_output, input, A[reserve, ...])
 
-        # We ignore e here since the magnitude should not affect the gradient of the direction
-        grad_A = torch.einsum("...r,...i->ri", grad_pre_B, input.to(dtype=grad_output.dtype))
+        grad_pre_B = torch.einsum("...o,or->...r", grad_output, B)
 
-        grad_e = torch.einsum("...r,...i,ri->r", grad_pre_B, input.to(dtype=grad_output.dtype), A.to(dtype=grad_output.dtype)).unsqueeze(-1)
+        grad_A = torch.empty(A.shape, dtype=dtype, device=device)
+
+        grad_A[~reserve] = torch.einsum("...r,...i,r->ri", grad_pre_B[..., ~reserve], input, e[~reserve].squeeze(-1))
+        grad_A[ reserve] = torch.einsum("...r,...i->ri", grad_pre_B[..., reserve], input)
+
+        grad_e = torch.einsum("...r,...i,ri->r", grad_pre_B, input, A).unsqueeze(-1)
 
         # If the module is non-reserve, the gradient should be propagated
-        grad_input = torch.einsum("ri,r,...r->...i", A[~reserve].to(dtype=grad_output.dtype), e[~reserve].squeeze(-1).to(dtype=grad_output.dtype), grad_pre_B[..., ~reserve])
+        grad_input = torch.einsum("ri,r,...r->...i", A[~reserve], e[~reserve].squeeze(-1), grad_pre_B[..., ~reserve])
+
         return grad_input, grad_A, grad_B, grad_e, None
 
 
@@ -165,11 +183,10 @@ class SVDLinear(nn.Module, GrowRALayer):
         self._active_adapter = adapter_name
 
         self.dynamic_scaling = dynamic_scaling
-        self.target_r = target_r
 
         self.hook_handle = None
 
-        self.update_layer(adapter_name, init_r, lora_alpha, lora_dropout, init_lora_weights)
+        self.update_layer(adapter_name, init_r, lora_alpha, lora_dropout, init_lora_weights, target_r)
         # self.add_reserve_ranks(adapter_name, reserve_ranks)
         # self._move_adapter_to_device_of_base_layer(adapter_name)
 
@@ -226,7 +243,7 @@ class SVDLinear(nn.Module, GrowRALayer):
         if self.dynamic_scaling:
             return self.scaling[adapter]  / max(self.r[adapter], 1)
         else:
-            return self.scaling[adapter] / self.target_r
+            return self.scaling[adapter] / self.target_r[adapter]
 
     def get_delta_weight(self, adapter) -> torch.Tensor:
         lora_A = torch.cat(tuple(self.lora_A[adapter]), 0)

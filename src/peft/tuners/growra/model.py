@@ -109,6 +109,7 @@ class GrowRAModel(LoraModel):
     ):
         kwargs = {
             "init_r": lora_config.init_r,
+            "target_r": lora_config.target_r,
             "reserve_ranks": lora_config.reserve_ranks,
             "dynamic_scaling": lora_config.dynamic_scaling,
             "lora_alpha": lora_config.lora_alpha,
@@ -135,6 +136,7 @@ class GrowRAModel(LoraModel):
                 lora_config.lora_alpha,
                 lora_config.lora_dropout,
                 lora_config.init_lora_weights,
+                lora_config.target_r,
             )
 
     @staticmethod
@@ -224,6 +226,7 @@ class GrowRAModel(LoraModel):
                 lora_config.lora_alpha,
                 lora_config.lora_dropout,
                 lora_config.init_lora_weights,
+                target_r=lora_config.target_r,
             )
 
             add_r = len(pattern)
