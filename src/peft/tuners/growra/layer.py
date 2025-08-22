@@ -127,7 +127,7 @@ class GrowRAComputation(torch.autograd.Function):
         input = input.to(dtype=dtype)
         A = A.to(dtype=dtype)
         B = B.to(dtype=dtype)
-        e = e.to(dtype=dtype).squeeze(-1)
+        e = e.to(dtype=dtype).squeeze(-1).clone()
 
         # o: index along output dimension
         # r: index along ranks

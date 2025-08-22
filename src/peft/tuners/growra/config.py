@@ -40,6 +40,7 @@ class GrowRAConfig(LoraConfig):
     )
 
     orthonormalize: bool = field(default=False, metadata={"help": "Whether to enforce orthonormalization."})
+    orthonormalize_reserve_only: bool = field(default=False, metadata={"help": "Whether to enforce orthonormalization only on the reserve ranks."})
     dynamic_scaling: bool = field(default=True, metadata={"help": "Whether to scale adapter contribution based on current rank (instead of target_r)."})
 
     init_lora_weights: (
@@ -50,7 +51,6 @@ class GrowRAConfig(LoraConfig):
     tfinal: int = field(default=0, metadata={"help": "The steps of final warmup."})
     beta1: float = field(default=0.85, metadata={"help": "Hyperparameter of EMA."})
     beta2: float = field(default=0.85, metadata={"help": "Hyperparameter of EMA."})
-    orth_reg_weight: float = field(default=0.5, metadata={"help": "The orthogonal regularization coefficient."})
     total_step: Optional[int] = field(default=None, metadata={"help": "The total training steps."})
     rank_pattern: Optional[dict[str, list[bool]]] = field(default=None, metadata={"help": "The saved rank pattern."})
 

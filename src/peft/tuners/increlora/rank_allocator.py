@@ -297,7 +297,7 @@ class RankAllocator:
                 self.increase_to_target_rank(model, optimizer)
 
         if self.peft_config.orthonormalize:
-            gram_schmidt_orthonormalize_model(model)
+            gram_schmidt_orthonormalize_model(model, reserve_only=self.peft_config.orthonormalize_reserve_only)
 
         if global_step % training_args.logging_steps == 0:
             metrics = {}
