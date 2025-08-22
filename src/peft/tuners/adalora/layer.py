@@ -31,7 +31,7 @@ else:
     from transformers.deepspeed import deepspeed_config
 
 
-from .gram_schmidt import gram_schmidt_orthonormalize_model
+from utils.gram_schmidt import gram_schmidt_orthonormalize_model
 
 
 class AdaLoraLayer(LoraLayer):

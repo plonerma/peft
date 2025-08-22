@@ -18,7 +18,7 @@ from typing import Callable
 
 import torch
 
-from ..adalora.gram_schmidt import gram_schmidt_orthonormalize_model
+from utils.gram_schmidt import gram_schmidt_orthonormalize_model
 from .config import GrowRAConfig
 from .layer import SVDLinear
 from .model import GrowRAModel
