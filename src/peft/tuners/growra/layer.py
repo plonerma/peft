@@ -110,48 +110,48 @@ class GrowRAComputation(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, A, B, e, reserve):
         # Only include non-reserve in the computation
-        pre_B = torch.einsum("...i,ri,r->...r", input, A[~reserve, ...], e[~reserve].squeeze(-1))
+        z = torch.einsum("...i,ri,r,or->...o", input, A[~reserve, ...], e[~reserve].squeeze(-1), B[..., ~reserve])
 
-        z = torch.einsum("...r,or->...o", pre_B, B[..., ~reserve])
-
-        ctx.save_for_backward(input, pre_B, A, B, e, reserve)
+        ctx.save_for_backward(input, A, B, e, reserve)
 
         return z
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad_output):
-        input, pre_B, A, B, e, reserve = ctx.saved_tensors
+        input, A, B, e, reserve = ctx.saved_tensors
 
         device = grad_output.device
         dtype = grad_output.dtype
 
         input = input.to(dtype=dtype)
-        pre_B = pre_B.to(dtype=dtype)
         A = A.to(dtype=dtype)
         B = B.to(dtype=dtype)
-        e = e.to(dtype=dtype)
+        e = e.to(dtype=dtype).squeeze(-1)
 
         # o: index along output dimension
         # r: index along ranks
         # i: index along input dimension
-        grad_B = torch.empty(B.shape, dtype=grad_output.dtype, device=device)
 
         # In the reserve, the magnitude is ignored to not scale down the gradient while in the already added ranks, the magnitude is used
-        grad_B[..., ~reserve] = torch.einsum("...o,...r->or", grad_output, pre_B)
-        grad_B[...,  reserve] = torch.einsum("...o,...i,...ri->or", grad_output, input, A[reserve, ...])
+        e[reserve] = 1.0
+        grad_B = torch.einsum("...o,...i,ri,r->or", grad_output, input, A, e)
+
 
         grad_pre_B = torch.einsum("...o,or->...r", grad_output, B)
 
         grad_A = torch.empty(A.shape, dtype=dtype, device=device)
 
-        grad_A[~reserve] = torch.einsum("...r,...i,r->ri", grad_pre_B[..., ~reserve], input, e[~reserve].squeeze(-1))
-        grad_A[ reserve] = torch.einsum("...r,...i->ri", grad_pre_B[..., reserve], input)
+        #grad_A[~reserve] = torch.einsum("...r,...i,r->ri", grad_pre_B[..., ~reserve], input, e[~reserve].squeeze(-1))
+        #grad_A[ reserve] = torch.einsum("...r,...i->ri", grad_pre_B[..., reserve], input)
 
+        e[reserve] = 1.0
+        grad_A = torch.einsum("...r,...i,r->ri", grad_pre_B, input, e)
         grad_e = torch.einsum("...r,...i,ri->r", grad_pre_B, input, A).unsqueeze(-1)
 
         # If the module is non-reserve, the gradient should be propagated
-        grad_input = torch.einsum("ri,r,...r->...i", A[~reserve], e[~reserve].squeeze(-1), grad_pre_B[..., ~reserve])
+        e[reserve] = 0.0
+        grad_input = torch.einsum("ri,r,...r->...i", A, e, grad_pre_B)
 
         return grad_input, grad_A, grad_B, grad_e, None
 

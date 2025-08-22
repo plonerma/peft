@@ -154,7 +154,6 @@ class RankAllocator:
                 reserve = layer.get_reserve_mask(self.adapter_name)
                 module_scores[n] = self.exp_avg_ipt[n][reserve] * self.exp_avg_unc[n][reserve]
 
-
         return module_scores
 
     def increase_layer_rank(self, layer: SVDLinear, ranks_to_add: list[bool]) -> list[torch.nn.Parameter]:
