@@ -31,7 +31,7 @@ else:
     from transformers.deepspeed import deepspeed_config
 
 
-from utils.gram_schmidt import gram_schmidt_orthonormalize_model
+from utils.orthonormalization import orthonormalize_model, normalize_model
 
 
 class AdaLoraLayer(LoraLayer):
@@ -265,9 +265,8 @@ class RankAllocator:
             if self.adapter_name not in n:
                 continue
 
-            if  (
-                (self.peft_config.alternative_scoring and "lora_E" in n)
-                or (not self.peft_config.alternative_scoring and "lora_" in n)
+            if (self.peft_config.alternative_scoring and "lora_E" in n) or (
+                not self.peft_config.alternative_scoring and "lora_" in n
             ):
                 if n not in self.ipt:
                     self.ipt[n] = torch.zeros_like(p)
@@ -358,7 +357,7 @@ class RankAllocator:
         with torch.no_grad():
             for n, p in model.named_parameters():
                 if f"lora_E.{self.adapter_name}" in n:
-                    pattern = (module_scores[n] >= mask_threshold)
+                    pattern = module_scores[n] >= mask_threshold
                     p.masked_fill_(~pattern.unsqueeze(-1), 0.0)
                     rank_pattern[n] = pattern.tolist()
 
@@ -375,14 +374,22 @@ class RankAllocator:
         elif self.rank_pattern is not None:
             self.mask_using_rank_pattern(model, self.rank_pattern)
 
+
         if self.peft_config.orthonormalize:
-            gram_schmidt_orthonormalize_model(model)
+            orthonormalize_model(model)
+
+        if self.peft_config.normalize:
+            normalize_model(model)
+
 
         if global_step % training_args.logging_steps == 0:
             metrics = {}
 
             if self.rank_pattern is not None:
-                metrics = {"traing/avg_rank": sum(sum(pattern) for pattern in self.rank_pattern.values()) / len(self.rank_pattern)}
+                metrics = {
+                    "traing/avg_rank": sum(sum(pattern) for pattern in self.rank_pattern.values())
+                    / len(self.rank_pattern)
+                }
 
             def compute_and_log(mat_cov, name):
                 I = torch.eye(*mat_cov.size(), out=torch.empty_like(mat_cov))
@@ -423,4 +430,3 @@ class RankAllocator:
                     key = n if not is_adapter_name_truncated else n.replace(f".{self.adapter_name}", "")
                     pattern = torch.Tensor(rank_pattern[key]).bool().to(p.device)
                     p.masked_fill_(~pattern.unsqueeze(-1), 0.0)
-

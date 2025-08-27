@@ -90,9 +90,8 @@ class GrowRALayer(LoraLayer):
                     nn.init.zeros_(p)
 
                 for p in chain(self.lora_A[adapter_name], self.lora_B[adapter_name]):
-
                     nn.init.normal_(p, mean=0.0, std=0.02)
-        else:
+        elif init_lora_weights.lower() == "lora":
             if adapter_name in self.lora_A.keys():
                 for p in self.lora_E[adapter_name]:
                     nn.init.ones_(p)
@@ -103,7 +102,20 @@ class GrowRALayer(LoraLayer):
                 for p in self.lora_B[adapter_name]:
                     nn.init.zeros_(p)
 
+        elif init_lora_weights.lower() == "growra":
+            if adapter_name in self.lora_A.keys():
+                for p in self.lora_E[adapter_name]:
+                    nn.init.zeros_(p)
 
+                for p in self.lora_A[adapter_name]:
+                    nn.init.kaiming_uniform_(p, a=math.sqrt(5))
+
+                for p in self.lora_B[adapter_name]:
+                    nn.init.kaiming_uniform_(p, a=math.sqrt(5))
+
+        else:
+            msg = f"Weight init method `{init_lora_weights}` unkown."
+            raise ValueError(msg)
 
 
 class GrowRAComputation(torch.autograd.Function):
@@ -137,13 +149,12 @@ class GrowRAComputation(torch.autograd.Function):
         e[reserve] = 1.0
         grad_B = torch.einsum("...o,...i,ri,r->or", grad_output, input, A, e)
 
-
         grad_pre_B = torch.einsum("...o,or->...r", grad_output, B)
 
         grad_A = torch.empty(A.shape, dtype=dtype, device=device)
 
-        #grad_A[~reserve] = torch.einsum("...r,...i,r->ri", grad_pre_B[..., ~reserve], input, e[~reserve].squeeze(-1))
-        #grad_A[ reserve] = torch.einsum("...r,...i->ri", grad_pre_B[..., reserve], input)
+        # grad_A[~reserve] = torch.einsum("...r,...i,r->ri", grad_pre_B[..., ~reserve], input, e[~reserve].squeeze(-1))
+        # grad_A[ reserve] = torch.einsum("...r,...i->ri", grad_pre_B[..., reserve], input)
 
         e[reserve] = 1.0
         grad_A = torch.einsum("...r,...i,r->ri", grad_pre_B, input, e)
@@ -154,7 +165,6 @@ class GrowRAComputation(torch.autograd.Function):
         grad_input = torch.einsum("ri,r,...r->...i", A, e, grad_pre_B)
 
         return grad_input, grad_A, grad_B, grad_e, None
-
 
 
 class SVDLinear(nn.Module, GrowRALayer):
@@ -241,7 +251,7 @@ class SVDLinear(nn.Module, GrowRALayer):
 
     def get_scaling_coeff(self, adapter) -> float:
         if self.dynamic_scaling:
-            return self.scaling[adapter]  / max(self.r[adapter], 1)
+            return self.scaling[adapter] / max(self.r[adapter], 1)
         else:
             return self.scaling[adapter] / self.target_r[adapter]
 
@@ -249,10 +259,7 @@ class SVDLinear(nn.Module, GrowRALayer):
         lora_A = torch.cat(tuple(self.lora_A[adapter]), 0)
         lora_B = torch.cat(tuple(self.lora_B[adapter]), 1)
         lora_E = torch.cat(tuple(self.lora_E[adapter]), 0)
-        return (
-            transpose(lora_B @ (lora_A * lora_E), self.fan_in_fan_out)
-            * self.get_scaling_coeff(adapter)
-        )
+        return transpose(lora_B @ (lora_A * lora_E), self.fan_in_fan_out) * self.get_scaling_coeff(adapter)
 
     def backward_hook(self, param, grad, apply_sum=False):
         # scale_W = torch.mean(W)
@@ -280,7 +287,6 @@ class SVDLinear(nn.Module, GrowRALayer):
                 x = x.to(self.lora_A[active_adapter][0].dtype)
 
                 if self.training:
-
                     lora_A = torch.cat(list(self.lora_A[active_adapter]), 0)
                     lora_B = torch.cat(list(self.lora_B[active_adapter]), 1)
                     lora_E = torch.cat(list(self.lora_E[active_adapter]), 0)
@@ -292,7 +298,9 @@ class SVDLinear(nn.Module, GrowRALayer):
                         lora_E.requires_grad_(True)
                         self.hook_handle = lora_E.register_hook(partial(self.backward_hook, lora_E))
 
-                    result += GrowRAComputation.apply(dropout(x), lora_A, lora_B, lora_E, self.get_reserve_mask(active_adapter)) * self.get_scaling_coeff(active_adapter)
+                    result += GrowRAComputation.apply(
+                        dropout(x), lora_A, lora_B, lora_E, self.get_reserve_mask(active_adapter)
+                    ) * self.get_scaling_coeff(active_adapter)
                 else:
                     rank_pattern = self.rank_pattern[active_adapter]
                     if any(rank_pattern):
@@ -306,13 +314,15 @@ class SVDLinear(nn.Module, GrowRALayer):
                             [rank for rank, use in zip(self.lora_E[active_adapter], rank_pattern) if use], 0
                         )
 
-                        result += (dropout(x) @ (lora_A * lora_E).T @ lora_B.T) * self.get_scaling_coeff(active_adapter)
+                        result += (dropout(x) @ (lora_A * lora_E).T @ lora_B.T) * self.get_scaling_coeff(
+                            active_adapter
+                        )
 
         return result
 
     def __repr__(self) -> str:
         rep = super().__repr__()
-        return "increlora." + rep
+        return "growra." + rep
 
     def add_reserve_ranks(self, adapter_name, add_r) -> list[nn.Parameter]:
         parameters: list[nn.Parameter] = []
@@ -335,20 +345,29 @@ class SVDLinear(nn.Module, GrowRALayer):
         return parameters
 
     def get_reserve_mask(self, adapter_name):
-        return torch.cat([
-            torch.full((e.size(0), ), not r)
-            for r, e in zip(self.rank_pattern[adapter_name], self.lora_E[adapter_name])
-        ])
+        return torch.cat(
+            [
+                torch.full((e.size(0),), not r)
+                for r, e in zip(self.rank_pattern[adapter_name], self.lora_E[adapter_name])
+            ]
+        )
 
     def get_rank(self, adapter_name, *, include_reserve=False) -> int:
-        return sum((
-            e.size(0)
-            for r, e in zip(self.rank_pattern[adapter_name], self.lora_E[adapter_name])
-            if r or include_reserve
-        ))
+        return sum(
+            (
+                e.size(0)
+                for r, e in zip(self.rank_pattern[adapter_name], self.lora_E[adapter_name])
+                if r or include_reserve
+            )
+        )
 
     def drop_reserve(self, adapter_name):
-        self.lora_A[adapter_name] = torch.nn.ParameterList([a for r, a in zip(self.rank_pattern[adapter_name], self.lora_A[adapter_name]) if r])
-        self.lora_B[adapter_name] = torch.nn.ParameterList([b for r, b in zip(self.rank_pattern[adapter_name], self.lora_B[adapter_name]) if r])
-        self.lora_E[adapter_name] = torch.nn.ParameterList([e for r, e in zip(self.rank_pattern[adapter_name], self.lora_E[adapter_name]) if r])
-
+        self.lora_A[adapter_name] = torch.nn.ParameterList(
+            [a for r, a in zip(self.rank_pattern[adapter_name], self.lora_A[adapter_name]) if r]
+        )
+        self.lora_B[adapter_name] = torch.nn.ParameterList(
+            [b for r, b in zip(self.rank_pattern[adapter_name], self.lora_B[adapter_name]) if r]
+        )
+        self.lora_E[adapter_name] = torch.nn.ParameterList(
+            [e for r, e in zip(self.rank_pattern[adapter_name], self.lora_E[adapter_name]) if r]
+        )

@@ -18,7 +18,7 @@ from typing import Callable
 
 import torch
 
-from utils.gram_schmidt import gram_schmidt_orthonormalize_model
+from utils.orthonormalization import orthonormalize_model, normalize_model
 from .config import GrowRAConfig
 from .layer import SVDLinear
 from .model import GrowRAModel
@@ -206,7 +206,6 @@ class RankAllocator:
         # Calculate the increasing threshold
         k = min(self.top_h * self.reserve_ranks, self.total_target_rank - self.total_current_rank)
 
-
         if not k > 0:
             return float("Inf")
 
@@ -284,7 +283,14 @@ class RankAllocator:
                 self.increase_to_target_rank(model, optimizer)
 
         if self.peft_config.orthonormalize:
-            gram_schmidt_orthonormalize_model(model, reserve_only=self.peft_config.orthonormalize_reserve_only)
+            orthonormalize_model(
+                model,
+                reserve_only=self.peft_config.orthonormalize_reserve_only,
+                ignore_non_reserve=self.peft_config.ignore_non_reserve
+            )
+
+        if self.peft_config.normalize:
+            normalize_model(model, reserve_only=self.peft_config.normalize_reserve_only)
 
         if global_step % training_args.logging_steps == 0:
             metrics = {}

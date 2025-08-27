@@ -49,8 +49,14 @@ class AdaLoraConfig(LoraConfig):
     total_step: Optional[int] = field(default=None, metadata={"help": "The total training steps."})
     rank_pattern: Optional[dict] = field(default=None, metadata={"help": "The saved rank pattern."})
 
-    alternative_scoring: bool = field(default=False, metadata={"help": "Whether to use the alternative scoring scheme."})
+    alternative_scoring: bool = field(
+        default=False, metadata={"help": "Whether to use the alternative scoring scheme."}
+    )
+
+
     orthonormalize: bool = field(default=False, metadata={"help": "Whether to enforce orthonormalization."})
+    normalize: bool = field(default=False, metadata={"help": "Whether to enforce normalization."})
+
 
     def __post_init__(self):
         super().__post_init__()

@@ -40,12 +40,24 @@ class GrowRAConfig(LoraConfig):
     )
 
     orthonormalize: bool = field(default=False, metadata={"help": "Whether to enforce orthonormalization."})
-    orthonormalize_reserve_only: bool = field(default=False, metadata={"help": "Whether to enforce orthonormalization only on the reserve ranks."})
-    dynamic_scaling: bool = field(default=True, metadata={"help": "Whether to scale adapter contribution based on current rank (instead of target_r)."})
+    orthonormalize_reserve_only: bool = field(
+        default=False, metadata={"help": "Whether to enforce orthonormalization only on the reserve ranks."}
+    )
+    orthonormalize_ignore_non_reserve: bool = field(
+        default=False, metadata={"help": "Whether to enforce orthonormalization only on the reserve ranks."}
+    )
 
-    init_lora_weights: (
-        Literal["lora", "increlora"]
-    ) = "lora"
+    normalize: bool = field(default=False, metadata={"help": "Whether to enforce normalization."})
+    normalize_reserve_only: bool = field(
+        default=False, metadata={"help": "Whether to enforce normalization only on the reserve ranks."}
+    )
+
+    dynamic_scaling: bool = field(
+        default=True,
+        metadata={"help": "Whether to scale adapter contribution based on current rank (instead of target_r)."},
+    )
+
+    init_lora_weights: Literal["lora", "increlora"] = "lora"
 
     tinit: int = field(default=0, metadata={"help": "The steps of initial warmup."})
     tfinal: int = field(default=0, metadata={"help": "The steps of final warmup."})

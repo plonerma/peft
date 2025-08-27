@@ -137,7 +137,7 @@ class IncreLoraModel(LoraModel):
                 lora_config.lora_alpha,
                 lora_config.lora_dropout,
                 lora_config.init_lora_weights,
-                lora_config.target_r
+                lora_config.target_r,
             )
             target.alternative_scoring = lora_config.alternative_scoring
             target.dynamic_scaling = lora_config.dynamic_scaling
@@ -162,8 +162,7 @@ class IncreLoraModel(LoraModel):
         elif isinstance(target_base_layer, Conv1D):
             if not kwargs["fan_in_fan_out"]:
                 warnings.warn(
-                    "fan_in_fan_out is set to False but the target module is `Conv1D`. "
-                    "Setting fan_in_fan_out to True."
+                    "fan_in_fan_out is set to False but the target module is `Conv1D`. Setting fan_in_fan_out to True."
                 )
                 kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = True
         else:
@@ -263,6 +262,10 @@ class IncreLoraModel(LoraModel):
 
         for module in self.modules():
             if isinstance(module, SVDLinear):
-                new_params.extend(module.add_reserve_ranks(self.trainable_adapter_name, self.peft_config[self.trainable_adapter_name].reserve_ranks))
+                new_params.extend(
+                    module.add_reserve_ranks(
+                        self.trainable_adapter_name, self.peft_config[self.trainable_adapter_name].reserve_ranks
+                    )
+                )
                 module._move_adapter_to_device_of_base_layer(self.trainable_adapter_name)
         return new_params
