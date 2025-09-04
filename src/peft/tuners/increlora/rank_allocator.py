@@ -292,7 +292,7 @@ class RankAllocator:
             if (
                 global_step >= 2  # At least 2 steps to initialize ipt score, uncertainty, etc.
                 and global_step >= warmup_steps  # warmup complete
-                and (global_step - warmup_steps) % self.peft_config.growth_interval == 0  # at growth step
+                and (1 + global_step - warmup_steps) % self.peft_config.growth_interval == 0  # at growth step
             ):
                 self.increase_to_target_rank(model, optimizer)
 
@@ -300,10 +300,10 @@ class RankAllocator:
             orthonormalize_model(
                 model,
                 reserve_only=self.peft_config.orthonormalize_reserve_only,
-                ignore_non_reserve=self.peft_config.ignore_non_reserve
+                ignore_non_reserve=self.peft_config.orthonormalize_ignore_non_reserve,
+                normalize=self.peft_config.normalize,
             )
-
-        if self.peft_config.normalize:
+        elif self.peft_config.normalize:
             normalize_model(model, reserve_only=self.peft_config.normalize_reserve_only)
 
         if global_step % training_args.logging_steps == 0:

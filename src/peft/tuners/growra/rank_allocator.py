@@ -109,7 +109,7 @@ class RankAllocator:
         self.peft_config.rank_pattern = model.get_rank_pattern(self.adapter_name)
 
     def reset_ipt(self):
-        self.ipt = {}
+        #self.ipt = {}
         self.exp_avg_ipt = {}
         self.exp_avg_unc = {}
 
@@ -119,22 +119,24 @@ class RankAllocator:
             if not isinstance(layer, SVDLinear):
                 continue
 
-            self.ipt[n] = layer.score
+            #self.ipt[n] = layer.score
+            ipt = layer.e_grad.abs()
+            layer.e_grad = None
 
             if n not in self.exp_avg_ipt:
-                self.exp_avg_ipt[n] = self.ipt[n]
+                self.exp_avg_ipt[n] = ipt
             else:
                 self.exp_avg_ipt[n] = (
-                    self.beta1 * self.exp_avg_ipt[n] + (1 - self.beta1) * self.ipt[n][: self.exp_avg_ipt[n].size(0)]
+                    self.beta1 * self.exp_avg_ipt[n] + (1 - self.beta1) * ipt[: self.exp_avg_ipt[n].size(0)]
                 )
 
-                r_added = self.ipt[n].size(0) > self.exp_avg_ipt[n].size(0)
+                r_added = ipt.size(0) > self.exp_avg_ipt[n].size(0)
 
                 if r_added:
                     # Size changed, expand with ipt values at that position
-                    self.exp_avg_ipt[n] = torch.cat([self.exp_avg_ipt[n], self.ipt[n][self.exp_avg_ipt[n].size(0) :]])
+                    self.exp_avg_ipt[n] = torch.cat([self.exp_avg_ipt[n], ipt[self.exp_avg_ipt[n].size(0) :]])
 
-                unc = (self.ipt[n] - self.exp_avg_ipt[n]).abs()
+                unc = (ipt - self.exp_avg_ipt[n]).abs()
 
                 if n not in self.exp_avg_unc:
                     self.exp_avg_unc[n] = unc
@@ -198,7 +200,7 @@ class RankAllocator:
         new_paramters.extend(layer.add_reserve_ranks(self.adapter_name, num_added))
         return new_paramters
 
-    def increase_to_target_rank(self, model, optimizer):
+    def increase_to_target_rank(self, model, optimizer, params_groups_kws):
         module_scores = self.retrieve_scores(model)
 
         metrics = {}
@@ -246,11 +248,11 @@ class RankAllocator:
             optimizer.add_param_group(
                 {
                     "params": new_param_list,
-                    "weight_decay": self.weight_decay,
+                    **params_groups_kws
                 }
             )
 
-            if self.total_current_rank == self.total_target_rank:
+            if self.total_current_rank >= self.total_target_rank:
                 # Disable advance learning
                 for layer in model.modules():
                     if isinstance(layer, SVDLinear):
@@ -278,41 +280,68 @@ class RankAllocator:
             if (
                 global_step >= 2  # At least 2 steps to initialize ipt score, uncertainty, etc.
                 and global_step >= warmup_steps  # warmup complete
-                and (global_step - warmup_steps) % self.peft_config.growth_interval == 0  # at growth step
+                and (1 + global_step - warmup_steps) % self.peft_config.growth_interval == 0  # at growth step
             ):
-                self.increase_to_target_rank(model, optimizer)
+                remeaining_steps = self.total_steps - global_step
+
+                self.increase_to_target_rank(
+                    model, optimizer,
+                    params_groups_kws={
+                        "weight_decay": self.weight_decay,
+                        "initial_step": global_step,
+                        "warmup_steps": training_args.get_warmup_steps(remeaining_steps),
+                        "remeaining_steps": remeaining_steps,
+                    }
+                )
 
         if self.peft_config.orthonormalize:
             orthonormalize_model(
                 model,
                 reserve_only=self.peft_config.orthonormalize_reserve_only,
-                ignore_non_reserve=self.peft_config.ignore_non_reserve
+                ignore_non_reserve=self.peft_config.orthonormalize_ignore_non_reserve,
+                normalize=self.peft_config.normalize,
             )
-
-        if self.peft_config.normalize:
+        elif self.peft_config.normalize:
             normalize_model(model, reserve_only=self.peft_config.normalize_reserve_only)
 
         if global_step % training_args.logging_steps == 0:
             metrics = {}
 
             def compute_and_log(mat_cov, name):
+                global orthogonal_loss_sum, normalization_loss_sum, num_elements
+
                 I = torch.eye(*mat_cov.size(), out=torch.empty_like(mat_cov))
                 I.requires_grad = False
-                orth_regu = torch.norm(mat_cov - I, p="fro")
-                regu_loss.append(orth_regu.item())
-                metrics[f"Orth_regu_loss/{name}"] = orth_regu.item()
+
+                norm_loss = torch.trace(mat_cov*mat_cov).item()
+                orth_loss = torch.norm(mat_cov - I, p="fro").item()
+
+                if global_step % 100 == 0:
+                    metrics[f"Norm_loss/{name}"] = norm_loss
+                    metrics[f"Orth_loss/{name}"] = orth_loss
+
+                return norm_loss, orth_loss - norm_loss
 
             with torch.no_grad():
-                regu_loss = []
+                orthogonal_loss_sum = 0
+                normalization_loss_sum = 0
+                num_elements = 0
+
                 for n, layer in model.named_modules():
                     if isinstance(layer, SVDLinear):
                         wA = torch.cat(list(layer.lora_A[self.adapter_name]), 0)
                         wB = torch.cat(list(layer.lora_B[self.adapter_name]), 1)
                         mat_cov_A = wA @ wA.T
                         mat_cov_B = wB.T @ wB
-                        compute_and_log(mat_cov_A, n + ".lora_A")
-                        compute_and_log(mat_cov_B, n + ".lora_B")
+                        nla, ola = compute_and_log(mat_cov_A, n + ".lora_A")
+                        nlb, olb = compute_and_log(mat_cov_B, n + ".lora_B")
 
-                metrics["train/orth_regu_loss"] = sum(regu_loss) / len(regu_loss)
+                        orthogonal_loss_sum += ola + olb
+                        normalization_loss_sum += nla + nlb
+
+                        num_elements += 2
+
+                metrics["train/norm_loss"] = normalization_loss_sum / num_elements
+                metrics["train/orth_loss"] = orthogonal_loss_sum / num_elements
 
             self.track_metrics(metrics)

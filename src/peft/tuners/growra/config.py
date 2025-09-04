@@ -57,6 +57,11 @@ class GrowRAConfig(LoraConfig):
         metadata={"help": "Whether to scale adapter contribution based on current rank (instead of target_r)."},
     )
 
+    growra_scale_all_grads: bool = field(
+        default=True,
+        metadata={"help": "Whether to scale A B gradients by the inverse of the gradient."},
+    )
+
     init_lora_weights: Literal["lora", "increlora"] = "lora"
 
     tinit: int = field(default=0, metadata={"help": "The steps of initial warmup."})

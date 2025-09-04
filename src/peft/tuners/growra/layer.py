@@ -84,6 +84,7 @@ class GrowRALayer(LoraLayer):
         self.set_adapter(self.active_adapters)
 
     def reset_lora_parameters(self, adapter_name, init_lora_weights):
+        self.init_lora_weights = init_lora_weights
         if init_lora_weights.lower() == "increlora":
             if adapter_name in self.lora_A.keys():
                 for p in self.lora_E[adapter_name]:
@@ -108,10 +109,10 @@ class GrowRALayer(LoraLayer):
                     nn.init.zeros_(p)
 
                 for p in self.lora_A[adapter_name]:
-                    nn.init.kaiming_uniform_(p, a=math.sqrt(5))
+                    nn.init.kaiming_uniform_(p, a=math.sqrt(5), nonlinearity="linear", mode="fan_in")
 
                 for p in self.lora_B[adapter_name]:
-                    nn.init.kaiming_uniform_(p, a=math.sqrt(5))
+                    nn.init.kaiming_uniform_(p, a=math.sqrt(5), nonlinearity="linear", mode="fan_out")
 
         else:
             msg = f"Weight init method `{init_lora_weights}` unkown."
@@ -120,11 +121,23 @@ class GrowRALayer(LoraLayer):
 
 class GrowRAComputation(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input, A, B, e, reserve):
+    def forward(ctx, input, A, B, e, reserve, scale_all_grads: bool = False):
         # Only include non-reserve in the computation
-        z = torch.einsum("...i,ri,r,or->...o", input, A[~reserve, ...], e[~reserve].squeeze(-1), B[..., ~reserve])
+
+        #z = torch.einsum("...i,ri,r,or->...o", input, A[~reserve, ...], e[~reserve].squeeze(-1), B[..., ~reserve])
+        #z = B[:, ~reserve] @ (e * (A[~reserve, :] @ input.unsqueeze(-1))).squeeze(-1)
+
 
         ctx.save_for_backward(input, A, B, e, reserve)
+        ctx.scale_all = scale_all_grads
+
+        A = A[~reserve, :]
+        e = e[~reserve, :]
+        B = B[:, ~reserve]
+
+        pre_b = e * (A @ input[..., :, None])
+
+        z = (B @ pre_b).squeeze(-1)
 
         return z
 
@@ -133,38 +146,45 @@ class GrowRAComputation(torch.autograd.Function):
     def backward(ctx, grad_output):
         input, A, B, e, reserve = ctx.saved_tensors
 
-        device = grad_output.device
-        dtype = grad_output.dtype
+        #device = grad_output.device
+        #dtype = grad_output.dtype
 
-        input = input.to(dtype=dtype)
-        A = A.to(dtype=dtype)
-        B = B.to(dtype=dtype)
-        e = e.to(dtype=dtype).squeeze(-1).clone()
+        #input = input.to(dtype=dtype)
+        #A = A.to(dtype=dtype)
+        #B = B.to(dtype=dtype)
+        #e = e.to(dtype=dtype).squeeze(-1).clone()
+        with torch.cuda.amp.autocast():
+            e = e.detach().clone()
 
-        # o: index along output dimension
-        # r: index along ranks
-        # i: index along input dimension
+            # o: index along output dimension
+            # r: index along ranks
+            # i: index along input dimension
 
-        # In the reserve, the magnitude is ignored to not scale down the gradient while in the already added ranks, the magnitude is used
-        e[reserve] = 1.0
-        grad_B = torch.einsum("...o,...i,ri,r->or", grad_output, input, A, e)
+            #grad_pre_B = torch.einsum("...o,or->...r", grad_output, B)
+            grad_pre_B = (grad_output[..., None, :] @ B).squeeze(-2)
 
-        grad_pre_B = torch.einsum("...o,or->...r", grad_output, B)
+            # The gradient should be propagated
+            #grad_input = torch.einsum("ri,r,...r->...i", A, e, grad_pre_B)
+            grad_input = ((grad_pre_B[..., None, ~reserve] * e[~reserve].T) @ A[~reserve]).squeeze(-2)
 
-        grad_A = torch.empty(A.shape, dtype=dtype, device=device)
+            # In the reserve, the magnitude is ignored to not scale down the gradient while in the already added ranks, the magnitude is used
+            e[reserve] = 1.0
 
-        # grad_A[~reserve] = torch.einsum("...r,...i,r->ri", grad_pre_B[..., ~reserve], input, e[~reserve].squeeze(-1))
-        # grad_A[ reserve] = torch.einsum("...r,...i->ri", grad_pre_B[..., reserve], input)
+            if ctx.scale_all:
+                e = torch.sign(e)
 
-        e[reserve] = 1.0
-        grad_A = torch.einsum("...r,...i,r->ri", grad_pre_B, input, e)
-        grad_e = torch.einsum("...r,...i,ri->r", grad_pre_B, input, A).unsqueeze(-1)
+            #grad_B = torch.einsum("...o,...i,ri,r->or", grad_output, input, A, e)
+            grad_B = grad_output[..., :, None] @ (input[..., None, :] @ (A * e).T)
 
-        # If the module is non-reserve, the gradient should be propagated
-        e[reserve] = 0.0
-        grad_input = torch.einsum("ri,r,...r->...i", A, e, grad_pre_B)
+            #e[reserve] = 1.0
+            #grad_A = torch.einsum("...r,...i,r->ri", grad_pre_B, input, e)
+            grad_A = (e * grad_pre_B[..., :, None]) @ input[..., None, :]
 
-        return grad_input, grad_A, grad_B, grad_e, None
+
+            #grad_e = torch.einsum("...r,...i,ri->r", grad_pre_B, input, A).unsqueeze(-1)
+            grad_e = (A @ input[..., :, None]) * grad_pre_B[..., None]
+
+            return grad_input, grad_A, grad_B, grad_e, None, None
 
 
 class SVDLinear(nn.Module, GrowRALayer):
@@ -182,6 +202,7 @@ class SVDLinear(nn.Module, GrowRALayer):
         fan_in_fan_out: bool = False,
         init_lora_weights: bool = True,
         dynamic_scaling: bool = True,
+        scale_all_grads: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -193,8 +214,11 @@ class SVDLinear(nn.Module, GrowRALayer):
         self._active_adapter = adapter_name
 
         self.dynamic_scaling = dynamic_scaling
+        self.scale_all_grads = scale_all_grads
 
         self.hook_handle = None
+
+        self.e_grad = None
 
         self.update_layer(adapter_name, init_r, lora_alpha, lora_dropout, init_lora_weights, target_r)
         # self.add_reserve_ranks(adapter_name, reserve_ranks)
@@ -262,9 +286,17 @@ class SVDLinear(nn.Module, GrowRALayer):
         return transpose(lora_B @ (lora_A * lora_E), self.fan_in_fan_out) * self.get_scaling_coeff(adapter)
 
     def backward_hook(self, param, grad, apply_sum=False):
+        """Note that this is the pre-accumulation gradient hook.
+
+        If gradients are accumulated, we also need to do this here.
+        """
+        if self.e_grad is None:
+            self.e_grad = grad.view(-1).detach().clone()
+        else:
+            self.e_grad += grad.view(-1).detach().clone()
         # scale_W = torch.mean(W)
-        score = (grad).abs().detach()
-        self.score = score.view(-1)
+        #score = (grad).abs().detach()
+        #self.score = score.view(-1)
 
         if self.hook_handle is not None:
             self.hook_handle.remove()
@@ -299,7 +331,8 @@ class SVDLinear(nn.Module, GrowRALayer):
                         self.hook_handle = lora_E.register_hook(partial(self.backward_hook, lora_E))
 
                     result += GrowRAComputation.apply(
-                        dropout(x), lora_A, lora_B, lora_E, self.get_reserve_mask(active_adapter)
+                        dropout(x), lora_A, lora_B, lora_E, self.get_reserve_mask(active_adapter),
+                        self.scale_all_grads,
                     ) * self.get_scaling_coeff(active_adapter)
                 else:
                     rank_pattern = self.rank_pattern[active_adapter]
@@ -333,8 +366,27 @@ class SVDLinear(nn.Module, GrowRALayer):
             )
             a = nn.Parameter(self.weight.new_empty((1, self.in_features)), requires_grad=True)
             b = nn.Parameter(self.weight.new_empty((self.out_features, 1)), requires_grad=True)
-            nn.init.normal_(a, mean=0.0, std=0.02)
-            nn.init.normal_(b, mean=0.0, std=0.02)
+
+            if self.init_lora_weights.lower() == "increlora":
+                nn.init.zeros_(e)
+                nn.init.normal_(a, mean=0.0, std=0.02)
+                nn.init.normal_(b, mean=0.0, std=0.02)
+
+            elif self.init_lora_weights.lower() == "lora":
+
+                nn.init.ones_(e)
+                nn.init.kaiming_uniform_(a, a=math.sqrt(5))
+                nn.init.zeros_(b)
+
+            elif self.init_lora_weights.lower() == "growra":
+                nn.init.zeros_(e)
+                nn.init.kaiming_uniform_(a, a=math.sqrt(5), nonlinearity="linear", mode="fan_in")
+                nn.init.kaiming_uniform_(b, a=math.sqrt(5), nonlinearity="linear", mode="fan_out")
+
+            else:
+                msg = f"Weight init method `{self.init_lora_weights}` unkown."
+                raise ValueError(msg)
+
             self.lora_E[adapter_name].append(e)
             self.lora_A[adapter_name].append(a)
             self.lora_B[adapter_name].append(b)
