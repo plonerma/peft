@@ -313,8 +313,10 @@ class RankAllocator:
                 I = torch.eye(*mat_cov.size(), out=torch.empty_like(mat_cov))
                 I.requires_grad = False
 
-                norm_loss = torch.trace(mat_cov*mat_cov).item()
-                orth_loss = torch.norm(mat_cov - I, p="fro").item()
+                m = mat_cov - I
+
+                norm_loss = torch.trace(m*m).item()
+                orth_loss = torch.norm(m, p="fro").item()
 
                 if global_step % 100 == 0:
                     metrics[f"Norm_loss/{name}"] = norm_loss
