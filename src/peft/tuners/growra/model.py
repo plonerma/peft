@@ -164,6 +164,7 @@ class GrowRAModel(LoraModel):
                 )
                 kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = True
         else:
+
             raise ValueError(
                 f"Target module {target} is not supported. "
                 f"Currently, only `torch.nn.Linear` and `Conv1D` are supported."
@@ -216,9 +217,9 @@ class GrowRAModel(LoraModel):
             key = ".".join(parts)
             _, target, _ = _get_submodules(self.model, key)
 
-            lora_E_weights = target.lora_E[adapter_name]
-            lora_A_weights = target.lora_A[adapter_name]
-            lora_B_weights = target.lora_B[adapter_name]
+            #lora_E_weights = target.lora_E[adapter_name]
+            #lora_A_weights = target.lora_A[adapter_name]
+            #lora_B_weights = target.lora_B[adapter_name]
 
             target.update_layer(
                 adapter_name,
@@ -239,10 +240,11 @@ class GrowRAModel(LoraModel):
 
             target.add_reserve_ranks(adapter_name, add_r)
 
-            with torch.no_grad():
-                target.lora_E[adapter_name][0].copy_(lora_E_weights[0])
-                target.lora_A[adapter_name][0].copy_(lora_A_weights[0])
-                target.lora_B[adapter_name][0].copy_(lora_B_weights[0])
+            #if lora_config.init_r > 0:
+            #    with torch.no_grad():
+            #        target.lora_E[adapter_name][0].copy_(lora_E_weights[0])
+            #        target.lora_A[adapter_name][0].copy_(lora_A_weights[0])
+            #        target.lora_B[adapter_name][0].copy_(lora_B_weights[0])
 
             target.r[adapter_name] = ranknum
             target.rank_pattern[adapter_name] = pattern

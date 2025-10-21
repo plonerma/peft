@@ -280,6 +280,9 @@ class SVDLinear(nn.Module, GrowRALayer):
             return self.scaling[adapter] / self.target_r[adapter]
 
     def get_delta_weight(self, adapter) -> torch.Tensor:
+        if len(self.lora_A[adapter]) == 0:
+            return torch.zeros_like(self.base_layer.weight)
+
         lora_A = torch.cat(tuple(self.lora_A[adapter]), 0)
         lora_B = torch.cat(tuple(self.lora_B[adapter]), 1)
         lora_E = torch.cat(tuple(self.lora_E[adapter]), 0)
