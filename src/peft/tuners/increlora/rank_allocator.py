@@ -294,15 +294,15 @@ class RankAllocator:
                 and global_step >= warmup_steps  # warmup complete
                 and (1 + global_step - warmup_steps) % self.peft_config.growth_interval == 0  # at growth step
             ):
-                remeaining_steps = self.total_steps - global_step
+                remaining_steps = self.total_steps - global_step
 
                 self.increase_to_target_rank(
                     model, optimizer,
                     params_groups_kws={
                         "weight_decay": self.weight_decay,
                         "initial_step": global_step,
-                        "warmup_steps": training_args.get_warmup_steps(remeaining_steps),
-                        "remeaining_steps": remeaining_steps,
+                        "warmup_steps": training_args.get_warmup_steps(remaining_steps),
+                        "remaining_steps": remaining_steps,
                     }
                 )
 
@@ -330,9 +330,9 @@ class RankAllocator:
                 norm_loss = torch.trace(m*m).item()
                 orth_loss = torch.norm(m, p="fro").item()
 
-                if global_step % 100 == 0:
-                    metrics[f"Norm_loss/{name}"] = norm_loss
-                    metrics[f"Orth_loss/{name}"] = orth_loss
+                #if global_step % 100 == 0:
+                #    metrics[f"Norm_loss/{name}"] = norm_loss
+                #    metrics[f"Orth_loss/{name}"] = orth_loss
 
                 return norm_loss, orth_loss - norm_loss
 

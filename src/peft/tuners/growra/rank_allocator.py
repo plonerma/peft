@@ -14,7 +14,7 @@
 
 import logging
 import math
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 
@@ -47,6 +47,9 @@ class RankAllocator:
         peft_config: GrowRAConfig,
         adapter_name: str,
         track_metrics: Callable = lambda _: None,
+        random_selection: bool = False,
+        ignore_uncertainty: bool = False,
+        target_rank_pattern: Optional[dict[str, int]] = None
     ):
         self.peft_config = peft_config
         self.adapter_name = adapter_name
@@ -55,6 +58,12 @@ class RankAllocator:
         self.track_metrics = track_metrics
         assert self.beta1 > 0 and self.beta1 < 1
         assert self.beta2 > 0 and self.beta2 < 1
+
+        self.random_selection = random_selection
+        self.ignore_uncertainty = ignore_uncertainty
+
+        if random_selection:
+            logger.warning("Using random rank selection.")
 
         self.reset_ipt()
 
@@ -109,8 +118,7 @@ class RankAllocator:
         self.peft_config.rank_pattern = model.get_rank_pattern(self.adapter_name)
 
     def reset_ipt(self):
-        #self.ipt = {}
-        self.exp_avg_ipt = {}
+        self.exp_avg_grad = {}
         self.exp_avg_unc = {}
 
     def update_ipt(self, model):
@@ -120,23 +128,23 @@ class RankAllocator:
                 continue
 
             #self.ipt[n] = layer.score
-            ipt = layer.e_grad.abs()
+            grad = layer.e_grad
             layer.e_grad = None
 
-            if n not in self.exp_avg_ipt:
-                self.exp_avg_ipt[n] = ipt
+            if n not in self.exp_avg_grad:
+                self.exp_avg_grad[n] = grad
             else:
-                self.exp_avg_ipt[n] = (
-                    self.beta1 * self.exp_avg_ipt[n] + (1 - self.beta1) * ipt[: self.exp_avg_ipt[n].size(0)]
+                self.exp_avg_grad[n] = (
+                    self.beta1 * self.exp_avg_grad[n] + (1 - self.beta1) * grad[: self.exp_avg_grad[n].size(0)]
                 )
 
-                r_added = ipt.size(0) > self.exp_avg_ipt[n].size(0)
+                r_added = grad.size(0) > self.exp_avg_grad[n].size(0)
 
                 if r_added:
                     # Size changed, expand with ipt values at that position
-                    self.exp_avg_ipt[n] = torch.cat([self.exp_avg_ipt[n], ipt[self.exp_avg_ipt[n].size(0) :]])
+                    self.exp_avg_grad[n] = torch.cat([self.exp_avg_grad[n], grad[self.exp_avg_grad[n].size(0) :]])
 
-                unc = (ipt - self.exp_avg_ipt[n]).abs()
+                unc = (grad - self.exp_avg_grad[n]).abs()
 
                 if n not in self.exp_avg_unc:
                     self.exp_avg_unc[n] = unc
@@ -154,7 +162,39 @@ class RankAllocator:
         for n, layer in model.named_modules():
             if isinstance(layer, SVDLinear):
                 reserve = layer.get_reserve_mask(self.adapter_name)
-                module_scores[n] = self.exp_avg_ipt[n][reserve] * self.exp_avg_unc[n][reserve]
+
+                if self.random_selection:
+                    module_scores[n] = torch.rand_like(self.exp_avg_grad[n][reserve])
+
+                elif self.target_rank_pattern is not None:
+                    target_rank = 0
+                    for k, v in self.target_rank_pattern.items():
+                        if n.startswith(k):
+                            target_rank = v
+                            break
+
+                    current_rank = layer.r[self.adapter_name]
+                    reserve_ranks = self.reserve_ranks
+                    remaining_ranks = target_rank - current_rank
+
+                    module_scores[n] = torch.full_like(self.exp_avg_grad[n][reserve], -1)
+                    module_scores[n] += 0.5 * torch.rand_like(self.exp_avg_grad[n][reserve])
+
+                    if remaining_ranks > 0:
+
+                        mod = remaining_ranks % reserve_ranks
+                        div = remaining_ranks // reserve_ranks
+
+                        module_scores[n][:mod] = div + 1
+
+                        if div > 0:
+                            module_scores[n][mod:] = div
+
+                elif self.ignore_uncertainty:
+                    module_scores[n] = self.exp_avg_grad[n][reserve].abs()
+
+                else:
+                    module_scores[n] = self.exp_avg_grad[n][reserve].abs() * self.exp_avg_unc[n][reserve]
 
         return module_scores
 
@@ -220,7 +260,6 @@ class RankAllocator:
             new_param_list = []
             for n, layer in model.named_modules():
                 if isinstance(layer, SVDLinear):
-                    num_added: int = 0
                     ranks_to_add: list[bool]
 
                     # one booelan per reserve rank
@@ -235,12 +274,10 @@ class RankAllocator:
                         # values for the reserve ranks)
                         ranks_to_add = [(not p) and next(add_rank) for p in layer.rank_pattern[self.adapter_name]]
 
-                        num_added = sum(ranks_to_add)
-
-                    if num_added > 0:
                         new_param_list.extend(self.increase_layer_rank(layer, ranks_to_add))
+
                         self.peft_config.rank_pattern[n] = layer.rank_pattern
-                        logger.info("The lora parameters rank of %s increased by %d", n, num_added)
+                        logger.info("The lora parameters rank of %s increased by %d", n, sum(ranks_to_add))
 
                     # log metrics
                     metrics[f"num_rank/{n}"] = layer.r[self.adapter_name]
@@ -282,15 +319,15 @@ class RankAllocator:
                 and global_step >= warmup_steps  # warmup complete
                 and (1 + global_step - warmup_steps) % self.peft_config.growth_interval == 0  # at growth step
             ):
-                remeaining_steps = self.total_steps - global_step
+                remaining_steps = self.total_steps - global_step
 
                 self.increase_to_target_rank(
                     model, optimizer,
                     params_groups_kws={
                         "weight_decay": self.weight_decay,
                         "initial_step": global_step,
-                        "warmup_steps": training_args.get_warmup_steps(remeaining_steps),
-                        "remeaining_steps": remeaining_steps,
+                        "warmup_steps": training_args.get_warmup_steps(remaining_steps),
+                        "remaining_steps": remaining_steps,
                     }
                 )
 
@@ -318,9 +355,9 @@ class RankAllocator:
                 norm_loss = torch.trace(m*m).item()
                 orth_loss = torch.norm(m, p="fro").item()
 
-                if global_step % 100 == 0:
-                    metrics[f"Norm_loss/{name}"] = norm_loss
-                    metrics[f"Orth_loss/{name}"] = orth_loss
+                #if global_step % 100 == 0:
+                #    metrics[f"Norm_loss/{name}"] = norm_loss
+                #    metrics[f"Orth_loss/{name}"] = orth_loss
 
                 return norm_loss, orth_loss - norm_loss
 
@@ -343,7 +380,7 @@ class RankAllocator:
 
                         num_elements += 2
 
-                metrics["train/norm_loss"] = normalization_loss_sum / num_elements
-                metrics["train/orth_loss"] = orthogonal_loss_sum / num_elements
+                metrics["loss_normal"] = normalization_loss_sum / num_elements
+                metrics["loss_orthogonal"] = orthogonal_loss_sum / num_elements
 
             self.track_metrics(metrics)
