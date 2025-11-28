@@ -197,6 +197,7 @@ class SVDLinear(nn.Module, GrowRALayer):
         init_r: int = 0,
         target_r: int = 0,
         reserve_ranks: int = 0,
+        advance_learn: bool = True,
         lora_alpha: int = 1,
         lora_dropout: float = 0.0,
         fan_in_fan_out: bool = False,
@@ -219,6 +220,8 @@ class SVDLinear(nn.Module, GrowRALayer):
         self.hook_handle = None
 
         self.e_grad = None
+
+        self.advance_learn = advance_learn
 
         self.update_layer(adapter_name, init_r, lora_alpha, lora_dropout, init_lora_weights, target_r)
         # self.add_reserve_ranks(adapter_name, reserve_ranks)
@@ -367,8 +370,8 @@ class SVDLinear(nn.Module, GrowRALayer):
                 self.weight.new_full((1, 1), self.EPS),
                 requires_grad=False,
             )
-            a = nn.Parameter(self.weight.new_empty((1, self.in_features)), requires_grad=True)
-            b = nn.Parameter(self.weight.new_empty((self.out_features, 1)), requires_grad=True)
+            a = nn.Parameter(self.weight.new_empty((1, self.in_features)), requires_grad=self.advance_learn)
+            b = nn.Parameter(self.weight.new_empty((self.out_features, 1)), requires_grad=self.advance_learn)
 
             if self.init_lora_weights.lower() == "increlora":
                 nn.init.zeros_(e)
@@ -396,7 +399,8 @@ class SVDLinear(nn.Module, GrowRALayer):
 
             self.rank_pattern[adapter_name].append(False)
 
-            parameters.extend((a, b))
+            if self.advance_learn:
+                parameters.extend((a, b))
         return parameters
 
     def get_reserve_mask(self, adapter_name):

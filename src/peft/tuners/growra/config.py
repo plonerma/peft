@@ -26,6 +26,7 @@ class GrowRAConfig(LoraConfig):
     init_r: int = field(default=12, metadata={"help": "Initial Lora matrix dimension."})
 
     growth_interval: int = field(default=1000, metadata={"help": "The time internval between two budget allocations."})
+    growth_delay: Optional[int] = field(default=None, metadata={"help": "Period before training starts (e.g. to warmup initial ranks, advance learn reserve ranks, compute ipt scores)."})
 
     num_top_modules: int = field(default=5, metadata={"help": "The number of modules selected."})
 
@@ -38,6 +39,8 @@ class GrowRAConfig(LoraConfig):
             )
         },
     )
+
+    advance_learn: bool = True
 
     orthonormalize: bool = field(default=False, metadata={"help": "Whether to enforce orthonormalization."})
     orthonormalize_reserve_only: bool = field(

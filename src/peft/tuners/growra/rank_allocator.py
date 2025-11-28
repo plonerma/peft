@@ -23,6 +23,7 @@ from .config import GrowRAConfig
 from .layer import SVDLinear
 from .model import GrowRAModel
 
+from peft.utils.other import get_pattern_key
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,8 @@ class RankAllocator:
         self.random_selection = random_selection
         self.ignore_uncertainty = ignore_uncertainty
 
+        self.target_rank_pattern = target_rank_pattern
+
         if random_selection:
             logger.warning("Using random rank selection.")
 
@@ -89,31 +92,39 @@ class RankAllocator:
         self.total_modules = total_modules
         self.total_current_rank = total_modules * self.peft_config.init_r
 
+        logger.info("Total steps: %d; total modules: %d", self.total_steps, self.total_modules)
+
+
         self.weight_decay = weight_decay
 
         rank_per_round = self.top_h * self.reserve_ranks
 
         total_additional_rank = self.total_modules * (self.peft_config.target_r - self.peft_config.init_r)
 
+        logger.info("Initial rank: %d; total additional ranks: %d", self.peft_config.init_r, total_additional_rank)
+
+
         num_rounds = math.ceil(total_additional_rank / rank_per_round)
 
         total_incre_step = self.peft_config.growth_interval * num_rounds
 
+        logger.info("Growing %d ranks per round => %d rounds of growth", rank_per_round, num_rounds)
+
         logger.info(
-            "Total incremental step: total_incre_step: %d, of total steps: %.2f (%d modules)",
+            "Total growth phase steps: %d; fraction of total steps: %.2f",
             total_incre_step,
             total_incre_step / total_steps,
-            self.total_modules,
         )
 
         new_params = model.setup_reserve_ranks()
 
-        optimizer.add_param_group(
-            {
-                "params": new_params,
-                "weight_decay": self.weight_decay,
-            }
-        )
+        if len(new_params) > 0:
+            optimizer.add_param_group(
+                {
+                    "params": new_params,
+                    "weight_decay": self.weight_decay,
+                }
+            )
 
         self.peft_config.rank_pattern = model.get_rank_pattern(self.adapter_name)
 
@@ -163,25 +174,24 @@ class RankAllocator:
             if isinstance(layer, SVDLinear):
                 reserve = layer.get_reserve_mask(self.adapter_name)
 
+                dtype = layer.lora_E[self.adapter_name][0].dtype
+                device = layer.lora_E[self.adapter_name][0].device
+                num_reserve = len(reserve)
+
                 if self.random_selection:
-                    module_scores[n] = torch.rand_like(self.exp_avg_grad[n][reserve])
+                    module_scores[n] = torch.rand(num_reserve, device=device, dtype=dtype)
 
                 elif self.target_rank_pattern is not None:
-                    target_rank = 0
-                    for k, v in self.target_rank_pattern.items():
-                        if n.startswith(k):
-                            target_rank = v
-                            break
+                    target_rank_key = get_pattern_key(self.target_rank_pattern, n)
+                    target_rank = self.target_rank_pattern.get(target_rank_key, 0)
 
                     current_rank = layer.r[self.adapter_name]
                     reserve_ranks = self.reserve_ranks
                     remaining_ranks = target_rank - current_rank
 
-                    module_scores[n] = torch.full_like(self.exp_avg_grad[n][reserve], -1)
-                    module_scores[n] += 0.5 * torch.rand_like(self.exp_avg_grad[n][reserve])
+                    module_scores[n] = torch.full((num_reserve, ), -1, device=device, dtype=dtype)
 
                     if remaining_ranks > 0:
-
                         mod = remaining_ranks % reserve_ranks
                         div = remaining_ranks // reserve_ranks
 
@@ -189,6 +199,8 @@ class RankAllocator:
 
                         if div > 0:
                             module_scores[n][mod:] = div
+
+                        module_scores[n] += 0.5 * torch.rand(num_reserve, device=device, dtype=dtype)
 
                 elif self.ignore_uncertainty:
                     module_scores[n] = self.exp_avg_grad[n][reserve].abs()
@@ -235,6 +247,14 @@ class RankAllocator:
 
             param_e.requires_grad = True
             new_paramters.append(param_e)
+
+            if not self.peft_config.advance_learn:
+                layer.lora_A[self.adapter_name][i].requires_grad = True
+                layer.lora_B[self.adapter_name][i].requires_grad = True
+
+                new_paramters.append(layer.lora_A[self.adapter_name][i])
+                new_paramters.append(layer.lora_B[self.adapter_name][i])
+
             layer.rank_pattern[self.adapter_name][i] = True
 
         new_paramters.extend(layer.add_reserve_ranks(self.adapter_name, num_added))
@@ -282,12 +302,13 @@ class RankAllocator:
                     # log metrics
                     metrics[f"num_rank/{n}"] = layer.r[self.adapter_name]
 
-            optimizer.add_param_group(
-                {
-                    "params": new_param_list,
-                    **params_groups_kws
-                }
-            )
+            if len(new_param_list) > 0:
+                optimizer.add_param_group(
+                    {
+                        "params": new_param_list,
+                        **params_groups_kws
+                    }
+                )
 
             if self.total_current_rank >= self.total_target_rank:
                 # Disable advance learning
@@ -313,12 +334,14 @@ class RankAllocator:
     def update_and_allocate(self, model, global_step, optimizer, training_args, **kw):
         if self.total_current_rank < self.total_target_rank:
             self.update_ipt(model)
-            warmup_steps = training_args.get_warmup_steps(self.total_steps)
-            if (
-                global_step >= 2  # At least 2 steps to initialize ipt score, uncertainty, etc.
-                and global_step >= warmup_steps  # warmup complete
-                and (1 + global_step - warmup_steps) % self.peft_config.growth_interval == 0  # at growth step
-            ):
+
+            growth_delay = self.peft_config.growth_delay
+
+            if growth_delay is None:
+                growth_delay = training_args.get_warmup_steps(self.total_steps)
+
+
+            if (global_step == -1) or (global_step >= 0 and (1 + global_step - growth_delay) % self.peft_config.growth_interval == 0):
                 remaining_steps = self.total_steps - global_step
 
                 self.increase_to_target_rank(
@@ -352,14 +375,21 @@ class RankAllocator:
 
                 m = mat_cov - I
 
-                norm_loss = torch.trace(m*m).item()
-                orth_loss = torch.norm(m, p="fro").item()
+                m_sqrt = m*m
+
+                norm_loss = torch.sqrt(torch.trace(m_sqrt)).item()
+
+                diag_indices = torch.arange(m_sqrt.shape[0])
+
+                m_sqrt[diag_indices, diag_indices] = 0
+
+                orth_loss = torch.sqrt(torch.sum(m_sqrt)).item()
 
                 #if global_step % 100 == 0:
                 #    metrics[f"Norm_loss/{name}"] = norm_loss
                 #    metrics[f"Orth_loss/{name}"] = orth_loss
 
-                return norm_loss, orth_loss - norm_loss
+                return norm_loss, orth_loss
 
             with torch.no_grad():
                 orthogonal_loss_sum = 0
