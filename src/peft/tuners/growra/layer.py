@@ -204,6 +204,7 @@ class SVDLinear(nn.Module, GrowRALayer):
         init_lora_weights: bool = True,
         dynamic_scaling: bool = True,
         scale_all_grads: bool = False,
+        reserve_rank_scoring: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -214,14 +215,15 @@ class SVDLinear(nn.Module, GrowRALayer):
         self.fan_in_fan_out = fan_in_fan_out
         self._active_adapter = adapter_name
 
+        self.advance_learn = advance_learn
         self.dynamic_scaling = dynamic_scaling
         self.scale_all_grads = scale_all_grads
+        self.reserve_rank_scoring = reserve_rank_scoring
 
         self.hook_handle = None
 
         self.e_grad = None
 
-        self.advance_learn = advance_learn
 
         self.update_layer(adapter_name, init_r, lora_alpha, lora_dropout, init_lora_weights, target_r)
         # self.add_reserve_ranks(adapter_name, reserve_ranks)
@@ -296,17 +298,13 @@ class SVDLinear(nn.Module, GrowRALayer):
 
         If gradients are accumulated, we also need to do this here.
         """
-        if self.e_grad is None:
-            self.e_grad = grad.view(-1).detach().clone()
+        if self.reserve_rank_scoring:
+            if self.e_grad is None:
+                self.e_grad = grad.view(-1).detach().clone()
+            else:
+                self.e_grad += grad.view(-1).detach().clone()
         else:
-            self.e_grad += grad.view(-1).detach().clone()
-        # scale_W = torch.mean(W)
-        #score = (grad).abs().detach()
-        #self.score = score.view(-1)
-
-        if self.hook_handle is not None:
-            self.hook_handle.remove()
-        # self.score = torch.mean((grad_Matrix ** 2).detach())
+            self.ipt = (param.detach() * grad.detach()).abs().mean()
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         if self.disable_adapters:
@@ -325,21 +323,30 @@ class SVDLinear(nn.Module, GrowRALayer):
                 x = x.to(self.lora_A[active_adapter][0].dtype)
 
                 if self.training:
-                    lora_A = torch.cat(list(self.lora_A[active_adapter]), 0)
-                    lora_B = torch.cat(list(self.lora_B[active_adapter]), 1)
-                    lora_E = torch.cat(list(self.lora_E[active_adapter]), 0)
+                    if self.reserve_rank_scoring:
+                        lora_A = torch.cat(list(self.lora_A[active_adapter]), 0)
+                        lora_B = torch.cat(list(self.lora_B[active_adapter]), 1)
+                        lora_E = torch.cat(list(self.lora_E[active_adapter]), 0)
 
-                    if torch.is_grad_enabled():
-                        # Note that this enables the gradient for the intermediate variable (concatenated Es, not the leaf parameters)
-                        if self.hook_handle is not None:
-                            self.hook_handle.remove()
-                        lora_E.requires_grad_(True)
-                        self.hook_handle = lora_E.register_hook(partial(self.backward_hook, lora_E))
+                        if torch.is_grad_enabled():
+                            # Note that this enables the gradient for the intermediate variable (concatenated Es, not the leaf parameters)
+                            if self.hook_handle is not None:
+                                self.hook_handle.remove()
+                            lora_E.requires_grad_(True)
+                            lora_E.register_hook(partial(self.backward_hook, lora_E))
 
-                    result += GrowRAComputation.apply(
-                        dropout(x), lora_A, lora_B, lora_E, self.get_reserve_mask(active_adapter),
-                        self.scale_all_grads,
-                    ) * self.get_scaling_coeff(active_adapter)
+                        result += GrowRAComputation.apply(
+                            dropout(x), lora_A, lora_B, lora_E, self.get_reserve_mask(active_adapter),
+                            self.scale_all_grads,
+                        ) * self.get_scaling_coeff(active_adapter)
+                    else:
+                        w = self.get_delta_weight(active_adapter)
+                        if torch.is_grad_enabled():
+                            if self.hook_handle is not None:
+                                self.hook_handle.remove()
+                            w.requires_grad_(True)
+                            w.register_hook(partial(self.backward_hook, w))
+                        result += dropout(x) @ w.T
                 else:
                     rank_pattern = self.rank_pattern[active_adapter]
                     if any(rank_pattern):

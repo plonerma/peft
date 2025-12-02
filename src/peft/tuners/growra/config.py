@@ -65,6 +65,12 @@ class GrowRAConfig(LoraConfig):
         metadata={"help": "Whether to scale A B gradients by the inverse of the gradient."},
     )
 
+    reserve_rank_scoring: bool = field(default=True, metadata={
+        "help": "Wether to score via the reserve rank gradient or the gradient of Delta W (as in IncerLoRA)."
+    })
+
+    disable_orthnorm_after_growth_complete: bool = False
+
     init_lora_weights: Literal["lora", "increlora"] = "lora"
 
     tinit: int = field(default=0, metadata={"help": "The steps of initial warmup."})

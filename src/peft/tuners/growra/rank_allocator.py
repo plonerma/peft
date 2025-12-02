@@ -92,6 +92,8 @@ class RankAllocator:
         self.total_modules = total_modules
         self.total_current_rank = total_modules * self.peft_config.init_r
 
+        model.growing = True
+
         logger.info("Total steps: %d; total modules: %d", self.total_steps, self.total_modules)
 
 
@@ -129,8 +131,26 @@ class RankAllocator:
         self.peft_config.rank_pattern = model.get_rank_pattern(self.adapter_name)
 
     def reset_ipt(self):
-        self.exp_avg_grad = {}
+        if self.peft_config.reserve_rank_scoring:
+            self.exp_avg_grad = {}
+        else:
+            self.exp_avg_ipt = {}
+
         self.exp_avg_unc = {}
+
+    @staticmethod
+    def moving_avg(avg, current, *, beta):
+        if avg is None:
+            return current
+
+        avg = (
+            beta * avg + (1 - beta) * current[:avg.size(0)]
+        )
+
+        if avg.size(0) < current.size(0):
+            avg = torch.cat([avg, current[avg.size(0):]])
+
+        return avg
 
     def update_ipt(self, model):
         # Update the sensitivity and uncertainty for every weight
@@ -138,33 +158,28 @@ class RankAllocator:
             if not isinstance(layer, SVDLinear):
                 continue
 
-            #self.ipt[n] = layer.score
-            grad = layer.e_grad
-            layer.e_grad = None
-
-            if n not in self.exp_avg_grad:
-                self.exp_avg_grad[n] = grad
-            else:
-                self.exp_avg_grad[n] = (
-                    self.beta1 * self.exp_avg_grad[n] + (1 - self.beta1) * grad[: self.exp_avg_grad[n].size(0)]
+            if self.peft_config.reserve_rank_scoring:
+                self.exp_avg_grad[n] = self.moving_avg(
+                    self.exp_avg_grad.get(n, None),
+                    layer.e_grad,
+                    beta=self.beta1
                 )
 
-                r_added = grad.size(0) > self.exp_avg_grad[n].size(0)
+                unc = (layer.e_grad - self.exp_avg_grad[n]).abs()
 
-                if r_added:
-                    # Size changed, expand with ipt values at that position
-                    self.exp_avg_grad[n] = torch.cat([self.exp_avg_grad[n], grad[self.exp_avg_grad[n].size(0) :]])
+                # Reset the gradient
+                layer.e_grad = None
 
-                unc = (grad - self.exp_avg_grad[n]).abs()
+            else:
+                self.exp_avg_ipt[n] = self.moving_avg(
+                    self.exp_avg_ipt.get(n, None),
+                    layer.ipt,
+                    beta=self.beta1
+                )
 
-                if n not in self.exp_avg_unc:
-                    self.exp_avg_unc[n] = unc
-                else:
-                    self.exp_avg_unc[n] = (
-                        self.beta2 * self.exp_avg_unc[n] + (1 - self.beta2) * unc[: self.exp_avg_unc[n].size(0)]
-                    )
-                    if r_added:
-                        self.exp_avg_unc[n] = torch.cat([self.exp_avg_unc[n], unc[self.exp_avg_unc[n].size(0) :]])
+                unc = (layer.ipt - self.exp_avg_ipt[n]).abs()
+
+            self.exp_avg_unc[n] = self.moving_avg(self.exp_avg_unc.get(n, None), unc, beta=self.beta2)
 
     def retrieve_scores(self, model) -> dict[str, torch.Tensor]:
         module_scores: dict[str, torch.Tensor] = {}
@@ -311,17 +326,8 @@ class RankAllocator:
                 )
 
             if self.total_current_rank >= self.total_target_rank:
-                # Disable advance learning
-                for layer in model.modules():
-                    if isinstance(layer, SVDLinear):
-                        for i, is_regular in enumerate(layer.rank_pattern):
-                            if not is_regular:
-                                layer.lora_E[self.adapter_name].fill_(0.0)
-                                layer.lora_E[self.adapter_name].requires_grad = False
-                                layer.lora_A[self.adapter_name].fill_(0.0)
-                                layer.lora_A[self.adapter_name].requires_grad = False
-                                layer.lora_B[self.adapter_name].fill_(0.0)
-                                layer.lora_B[self.adapter_name].requires_grad = False
+                model.drop_reserve()
+                self.growing = False
 
             metrics["budget/total_rank"] = self.total_current_rank
             metrics["budget/avg_rank"] = self.total_current_rank / self.total_modules
@@ -354,15 +360,16 @@ class RankAllocator:
                     }
                 )
 
-        if self.peft_config.orthonormalize:
-            orthonormalize_model(
-                model,
-                reserve_only=self.peft_config.orthonormalize_reserve_only,
-                ignore_non_reserve=self.peft_config.orthonormalize_ignore_non_reserve,
-                normalize=self.peft_config.normalize,
-            )
-        elif self.peft_config.normalize:
-            normalize_model(model, reserve_only=self.peft_config.normalize_reserve_only)
+        if model.growing or not self.peft_config.disable_orthnorm_after_growth_complete:
+            if self.peft_config.orthonormalize:
+                orthonormalize_model(
+                    model,
+                    reserve_only=self.peft_config.orthonormalize_reserve_only,
+                    ignore_non_reserve=self.peft_config.orthonormalize_ignore_non_reserve,
+                    normalize=self.peft_config.normalize,
+                )
+            elif self.peft_config.normalize:
+                normalize_model(model, reserve_only=self.peft_config.normalize_reserve_only)
 
         if global_step % training_args.logging_steps == 0:
             metrics = {}

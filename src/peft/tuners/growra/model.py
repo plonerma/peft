@@ -114,6 +114,7 @@ class GrowRAModel(LoraModel):
             "dynamic_scaling": lora_config.dynamic_scaling,
             "scale_all_grads": lora_config.growra_scale_all_grads,
             "advance_learn": lora_config.advance_learn,
+            "reserve_rank_scoring": lora_config.reserve_rank_scoring,
             "lora_alpha": lora_config.lora_alpha,
             "lora_dropout": lora_config.lora_dropout,
             "fan_in_fan_out": lora_config.fan_in_fan_out,
