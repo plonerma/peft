@@ -153,7 +153,7 @@ class GrowRAComputation(torch.autograd.Function):
         #A = A.to(dtype=dtype)
         #B = B.to(dtype=dtype)
         #e = e.to(dtype=dtype).squeeze(-1).clone()
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast("cuda"):
             e = e.detach().clone()
 
             # o: index along output dimension
@@ -370,7 +370,7 @@ class SVDLinear(nn.Module, GrowRALayer):
         rep = super().__repr__()
         return "growra." + rep
 
-    def add_reserve_ranks(self, adapter_name, add_r) -> list[nn.Parameter]:
+    def add_reserve_ranks(self, adapter_name: str, add_r: int) -> list[nn.Parameter]:
         parameters: list[nn.Parameter] = []
         for _ in range(add_r):
             e = nn.Parameter(
@@ -408,6 +408,7 @@ class SVDLinear(nn.Module, GrowRALayer):
 
             if self.advance_learn:
                 parameters.extend((a, b))
+
         return parameters
 
     def get_reserve_mask(self, adapter_name):

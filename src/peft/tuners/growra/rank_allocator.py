@@ -55,6 +55,8 @@ class RankAllocator:
         reserve_separate_groups: bool = False,
         reserve_constant_lr: bool = False,
         reserve_lr: Optional[float] = None,
+        reserve_betas: Optional[tuple[float, float]] = None,
+        reinit_after_growth: bool = False,
 
     ):
         self.peft_config = peft_config
@@ -72,7 +74,10 @@ class RankAllocator:
 
         self.reserve_weight_decay = reserve_weight_decay
         self.reserve_constant_lr = reserve_constant_lr
+        self.reserve_betas = reserve_betas
+        self.reserve_lr = reserve_lr
         self.reserve_separate_groups = reserve_separate_groups
+        self.reinit_after_growth = reinit_after_growth
 
         if random_selection:
             logger.warning("Using random rank selection.")
@@ -119,12 +124,11 @@ class RankAllocator:
 
         logger.info("Initial rank: %d; total additional ranks: %d", self.peft_config.init_r, total_additional_rank)
 
-
         num_rounds = math.ceil(total_additional_rank / rank_per_round)
 
         total_incre_step = self.peft_config.growth_interval * num_rounds
 
-        logger.info("Growing %d ranks per round => %d rounds of growth", rank_per_round, num_rounds)
+        logger.info("Growing %d ranks per round  => %d rounds of growth (each %d steps long)", rank_per_round, num_rounds, self.peft_config.growth_interval)
 
         logger.info(
             "Total growth phase steps: %d; fraction of total steps: %.2f",
@@ -134,12 +138,47 @@ class RankAllocator:
 
         new_params = model.setup_reserve_ranks()
 
+        logger.info("Adding %d reserve rank parameters", len(new_params))
+
         self.add_new_params(*new_params, reserve=True)
         self.update_param_groups(optimizer)
 
-        self.add_parameter_group(optimizer, new_params, reserve=True)
-
         self.peft_config.rank_pattern = model.get_rank_pattern(self.adapter_name)
+
+    def reinitialize(self, model, optimizer):
+        self.new_reserve_params.clear()
+        self.new_main_params.clear()
+        self.old_reserve_params.clear()
+
+        # Clear the optimizer groups
+        optimizer.state.clear()
+        optimizer.param_groups.clear()
+
+        # Reinitialize weights
+        for n, layer in model.named_modules():
+            if isinstance(layer, SVDLinear):
+                layer.reset_lora_parameters(
+                    adapter_name=self.adapter_name,
+                    init_lora_weights=self.peft_config.init_lora_weights,
+                )
+
+                # Add reinitialized parameters to the groups
+                for i, non_reserve in enumerate(layer.rank_pattern[self.adapter_name]):
+                    if non_reserve:
+                        params = (
+                            layer.lora_A[self.adapter_name][i],
+                            layer.lora_B[self.adapter_name][i],
+                            layer.lora_E[self.adapter_name][i],
+                        )
+                    elif self.peft_config.advance_learn:
+                        params = (
+                            layer.lora_A[self.adapter_name][i],
+                            layer.lora_B[self.adapter_name][i],
+                        )
+                    else:
+                        continue
+
+                    self.add_new_params(*params, reserve=not non_reserve)
 
     def add_new_params(self, *params, reserve: bool = False):
         if reserve:
@@ -152,7 +191,7 @@ class RankAllocator:
             param.requires_grad = True
             self.add_new_params(param, reserve=False)
 
-        elif self.separate_groups_for_reserve:
+        elif self.reserve_separate_groups:
             self.old_reserve_params.append(param)
             self.add_new_params(param, reserve=False)
 
@@ -162,77 +201,74 @@ class RankAllocator:
 
     @staticmethod
     def delete_param_from_groups(optimizer, param):
-        for i, group in enumerate(optimizer.param_groups):
-            try:
-                j = group["params"].index(param)
-            except ValueError:
-                # Not found
+        for group_index, group in enumerate(optimizer.param_groups):
+            param_index = None
+
+            for i, p in enumerate(group["params"]):
+                if p is param:
+                    param_index = i
+                    break
+
+            if param_index is None:
                 continue
 
             del optimizer.state[param]
-            del group["params"][j]
+            del group["params"][param_index]
 
             if len(group["params"]) == 0:
-                del optimizer.param_groups[i]
+                del optimizer.param_groups[group_index]
 
             return
 
-        msg = "Could not find parameter in `optimizer.param_groups`."
+        msg = f"Could not find parameter ({param.shape}) in `optimizer.param_groups`."
         raise ValueError(msg)
 
-    def update_param_groups(self, optimizer, params, reserve: bool = False, **kw):
+    def update_param_groups(self, optimizer, *, reserve: bool = False, **kw):
         if self.reserve_separate_groups:
-            for p in self.old_reserve_params:
+            for param in self.old_reserve_params:
                 self.delete_param_from_groups(optimizer, param)
 
             # Create new group sepcifically for the main params
-            if len(self.new_main_params) == 0:
-                return
-
-            optimizer.add_param_group(
-                {
-                    "params": self.new_main_params,
-                    "weight_decay": self.weight_decay,
-                    **kw
-                }
-            )
+            if len(self.new_main_params) > 0:
+                optimizer.add_param_group(
+                    {
+                        "params": self.new_main_params,
+                        "weight_decay": self.weight_decay,
+                        **kw
+                    }
+                )
 
             # Create group for the reserve ranks
-            if len(self.new_reserve_params) == 0:
-                return
-
-            reserve_kw = {
+            if len(self.new_reserve_params) > 0:
+                group = {
                     "params": self.new_reserve_params,
                     "weight_decay": self.reserve_weight_decay,
                     "constant": self.reserve_constant_lr,
                     **kw
                 }
-            if self.reserve_lr is not None:
-                reserve_kw["initial_lr"] = self.reserve_lr
 
-            optimizer.add_param_group(
-                **reserve_kw
-            )
+                if self.reserve_lr is not None:
+                    group["initial_lr"] = self.reserve_lr
+
+                if self.reserve_betas is not None:
+                    group["betas"] = tuple(self.reserve_betas)
+
+                optimizer.add_param_group(group)
 
         else:
             # We can throw both of the lists into one group
             params = self.new_reserve_params + self.new_main_params
 
-            if len(params) == 0:
-                return
-
-            optimizer.add_param_group(
-                {
-                    "params": params,
-                    "weight_decay": self.weight_decay,
-                    **kw
-                }
-            )
+            if len(params) > 0:
+                optimizer.add_param_group({
+                        "params": params,
+                        "weight_decay": self.weight_decay,
+                        **kw
+                    })
 
         self.old_reserve_params.clear()
         self.new_reserve_params.clear()
         self.new_main_params.clear()
-
 
     def reset_ipt(self):
         if self.peft_config.reserve_rank_scoring:
@@ -329,7 +365,7 @@ class RankAllocator:
 
         return module_scores
 
-    def increase_layer_rank(self, layer: SVDLinear, ranks_to_add: list[bool]):
+    def increase_layer_rank(self, layer: SVDLinear, ranks_to_add: list[bool]) -> None:
         """Add the selected ranks to the layer.Viola Brand,
 
         Args:
@@ -366,7 +402,7 @@ class RankAllocator:
 
         self.add_new_params(*layer.add_reserve_ranks(self.adapter_name, num_added), reserve=True)
 
-    def increase_to_target_rank(self, model, optimizer, param_group_kws):
+    def increase_to_target_rank(self, model, optimizer):
         module_scores = self.retrieve_scores(model)
 
         metrics = {}
@@ -383,7 +419,6 @@ class RankAllocator:
         increase_threshold = values[-1].item()
 
         with torch.no_grad():
-            new_param_list = []
             for n, layer in model.named_modules():
                 if isinstance(layer, SVDLinear):
                     ranks_to_add: list[bool]
@@ -400,18 +435,13 @@ class RankAllocator:
                         # values for the reserve ranks)
                         ranks_to_add = [(not p) and next(add_rank) for p in layer.rank_pattern[self.adapter_name]]
 
-                        new_param_list.extend(self.increase_layer_rank(layer, ranks_to_add))
+                        self.increase_layer_rank(layer, ranks_to_add)
 
                         self.peft_config.rank_pattern[n] = layer.rank_pattern
                         logger.info("The lora parameters rank of %s increased by %d", n, sum(ranks_to_add))
 
                     # log metrics
                     metrics[f"num_rank/{n}"] = layer.r[self.adapter_name]
-
-            self.update_param_groups(
-                optimizer,
-                **param_group_kws)
-
 
             if self.total_current_rank >= self.total_target_rank:
                 model.drop_reserve(self.adapter_name)
@@ -435,16 +465,36 @@ class RankAllocator:
                 growth_delay = training_args.get_warmup_steps(self.total_steps)
 
 
-            if (global_step == -1) or (global_step >= 0 and (1 + global_step - growth_delay) % self.peft_config.growth_interval == 0):
+            if (global_step == -1) or (global_step >= growth_delay and (global_step - growth_delay) % self.peft_config.growth_interval == 0):
+                logger.info(
+                    "Growth step at step %d (growth delay: %d (%s), growth interval: %d)",
+                    global_step,
+                    growth_delay,
+                    "set in config" if self.peft_config.growth_delay is not None else "warmup",
+                    self.peft_config.growth_interval,
+                )
+
                 remaining_steps = self.total_steps - global_step
 
                 self.increase_to_target_rank(
                     model, optimizer,
-                    param_group_kws={
-                        "initial_step": global_step,
-                        "warmup_steps": training_args.get_warmup_steps(remaining_steps),
-                        "remaining_steps": remaining_steps,
-                    }
+                )
+
+                param_group_kws={
+                    "initial_step": global_step,
+                    "warmup_steps": training_args.get_warmup_steps(remaining_steps),
+                    "remaining_steps": remaining_steps,
+                }
+
+                if self.reinit_after_growth:
+                    self.reinitialize(
+                        model=model,
+                        optimizer=optimizer
+                    )
+
+                self.update_param_groups(
+                    optimizer,
+                    **param_group_kws
                 )
 
         if model.growing or not self.peft_config.disable_orthnorm_after_growth_complete:

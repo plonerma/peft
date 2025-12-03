@@ -68,7 +68,7 @@ class GrowRAModel(LoraModel):
 
         if traininable_mode_counter > 1:
             raise ValueError(
-                "AdaLoraModel supports only 1 trainable adapter. "
+                "GrowRAModel supports only 1 trainable adapter. "
                 "When using multiple adapters, set inference_mode to True for all adapters except the one you want to train."
             )
 
@@ -259,16 +259,18 @@ class GrowRAModel(LoraModel):
 
         return rank_pattern
 
-    def setup_reserve_ranks(self):
+    def setup_reserve_ranks(self) -> list[torch.nn.Parameter]:
         new_params = []
 
-        for module in self.modules():
+        for n, module in self.named_modules():
             if isinstance(module, SVDLinear):
                 new_params.extend(
                     module.add_reserve_ranks(
-                        self.trainable_adapter_name, self.peft_config[self.trainable_adapter_name].reserve_ranks
+                        self.trainable_adapter_name,
+                        self.peft_config[self.trainable_adapter_name].reserve_ranks
                     )
                 )
+
                 module._move_adapter_to_device_of_base_layer(self.trainable_adapter_name)
         return new_params
 
