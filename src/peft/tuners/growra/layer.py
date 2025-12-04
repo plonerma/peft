@@ -428,13 +428,30 @@ class SVDLinear(nn.Module, GrowRALayer):
             )
         )
 
-    def drop_reserve(self, adapter_name):
-        self.lora_A[adapter_name] = torch.nn.ParameterList(
+    def drop_reserve(self, adapter_name) -> list[nn.Parameter]:
+        dropped_params = []
+
+        if self.advance_learn:
+            dropped_params.extend((
+                a for r, a in zip(self.rank_pattern[adapter_name], self.lora_A[adapter_name]) if not r
+            ))
+            dropped_params.extend((
+                b for r, b in zip(self.rank_pattern[adapter_name], self.lora_B[adapter_name]) if not r
+            ))
+
+        self.lora_A[adapter_name] = nn.ParameterList(
             [a for r, a in zip(self.rank_pattern[adapter_name], self.lora_A[adapter_name]) if r]
         )
-        self.lora_B[adapter_name] = torch.nn.ParameterList(
+        self.lora_B[adapter_name] = nn.ParameterList(
             [b for r, b in zip(self.rank_pattern[adapter_name], self.lora_B[adapter_name]) if r]
         )
-        self.lora_E[adapter_name] = torch.nn.ParameterList(
+        self.lora_E[adapter_name] = nn.ParameterList(
             [e for r, e in zip(self.rank_pattern[adapter_name], self.lora_E[adapter_name]) if r]
         )
+
+        # Delete reserve ranks from rank pattern (modfiy list in place to keep other references intact)
+        for i in reversed(range(len(self.rank_pattern[adapter_name]))):
+            if not self.rank_pattern[adapter_name][i]:
+                del self.rank_pattern[adapter_name][i]
+
+        return dropped_params

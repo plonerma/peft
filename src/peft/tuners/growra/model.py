@@ -274,7 +274,8 @@ class GrowRAModel(LoraModel):
                 module._move_adapter_to_device_of_base_layer(self.trainable_adapter_name)
         return new_params
 
-    def drop_reserve(self, adapter_name: str):
+    def drop_reserve(self, adapter_name: str) -> list[torch.nn.Parameter]:
+        dropped_params = []
         for module in self.modules():
             if isinstance(module, SVDLinear):
-                module.drop_reserve(adapter_name)
+                dropped_params.extend(module.drop_reserve(adapter_name))

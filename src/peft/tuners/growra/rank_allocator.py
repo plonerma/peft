@@ -444,7 +444,7 @@ class RankAllocator:
                     metrics[f"num_rank/{n}"] = layer.r[self.adapter_name]
 
             if self.total_current_rank >= self.total_target_rank:
-                model.drop_reserve(self.adapter_name)
+                self.old_reserve_params.extend(model.drop_reserve(self.adapter_name))
                 self.growing = False
 
             metrics["budget/total_rank"] = self.total_current_rank
