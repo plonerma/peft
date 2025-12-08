@@ -138,9 +138,7 @@ class RankAllocator:
 
         new_params = model.setup_reserve_ranks()
 
-        logger.info("Adding %d reserve rank parameters", len(new_params))
-
-        self.add_new_params(*new_params, reserve=True)
+        self.add_new_param(*new_params, reserve=True)
         self.update_param_groups(optimizer)
 
         self.peft_config.rank_pattern = model.get_rank_pattern(self.adapter_name)
@@ -178,9 +176,9 @@ class RankAllocator:
                     else:
                         continue
 
-                    self.add_new_params(*params, reserve=not non_reserve)
+                    self.add_new_param(*params, reserve=not non_reserve)
 
-    def add_new_params(self, *params, reserve: bool = False):
+    def add_new_param(self, *params, reserve: bool = False):
         if reserve:
             self.new_reserve_params.extend(params)
         else:
@@ -189,11 +187,11 @@ class RankAllocator:
     def make_param_main(self, param, *, already_trained: bool = False):
         if not already_trained:
             param.requires_grad = True
-            self.add_new_params(param, reserve=False)
+            self.add_new_param(param, reserve=False)
 
         elif self.reserve_separate_groups:
             self.old_reserve_params.append(param)
-            self.add_new_params(param, reserve=False)
+            self.add_new_param(param, reserve=False)
 
         else:
             # Nothing to be done here, we can continue to train the paramter as before
@@ -223,11 +221,25 @@ class RankAllocator:
         msg = f"Could not find parameter ({param.shape}) in `optimizer.param_groups`."
         raise ValueError(msg)
 
-    def update_param_groups(self, optimizer, *, reserve: bool = False, **kw):
-        if self.reserve_separate_groups:
-            for param in self.old_reserve_params:
+    def update_param_groups(self, optimizer, **kw):
+        logger.info("Removing %d reserve rank parameters", len(self.old_reserve_params))
+        logger.info("Adding %d reserve rank parameters", len(self.new_reserve_params))
+        logger.info("Adding %d main rank parameters", len(self.new_main_params))
+
+        for param in self.old_reserve_params:
+            param_index = None
+
+            for i, p in enumerate(self.new_reserve_params):
+                if p is param:
+                    param_index = i
+                    break
+
+            if param_index is not None:
+                del self.new_reserve_params[param_index]
+            else:
                 self.delete_param_from_groups(optimizer, param)
 
+        if self.reserve_separate_groups:
             # Create new group sepcifically for the main params
             if len(self.new_main_params) > 0:
                 optimizer.add_param_group(
@@ -240,26 +252,26 @@ class RankAllocator:
 
             # Create group for the reserve ranks
             if len(self.new_reserve_params) > 0:
-                group = {
-                    "params": self.new_reserve_params,
-                    "weight_decay": self.reserve_weight_decay,
-                    "constant": self.reserve_constant_lr,
-                    **kw
-                }
+               group = {
+                   "params": self.new_reserve_params,
+                   "weight_decay": self.reserve_weight_decay,
+                   "constant": self.reserve_constant_lr,
+                   **kw
+               }
 
-                if self.reserve_lr is not None:
-                    group["initial_lr"] = self.reserve_lr
+               if self.reserve_lr is not None:
+                   group["initial_lr"] = self.reserve_lr
 
-                if self.reserve_betas is not None:
-                    group["betas"] = tuple(self.reserve_betas)
+               if self.reserve_betas is not None:
+                   group["betas"] = tuple(self.reserve_betas)
 
-                optimizer.add_param_group(group)
+               optimizer.add_param_group(group)
 
         else:
             # We can throw both of the lists into one group
-            params = self.new_reserve_params + self.new_main_params
+           params = self.new_reserve_params + self.new_main_params
 
-            if len(params) > 0:
+           if len(params) > 0:
                 optimizer.add_param_group({
                         "params": params,
                         "weight_decay": self.weight_decay,
@@ -400,7 +412,7 @@ class RankAllocator:
 
             layer.rank_pattern[self.adapter_name][i] = True
 
-        self.add_new_params(*layer.add_reserve_ranks(self.adapter_name, num_added), reserve=True)
+        self.add_new_param(*layer.add_reserve_ranks(self.adapter_name, num_added), reserve=True)
 
     def increase_to_target_rank(self, model, optimizer):
         module_scores = self.retrieve_scores(model)

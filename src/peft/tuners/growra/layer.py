@@ -432,6 +432,7 @@ class SVDLinear(nn.Module, GrowRALayer):
         dropped_params = []
 
         if self.advance_learn:
+            # If a and b were learned before, they can now be removed from the optimizer
             dropped_params.extend((
                 a for r, a in zip(self.rank_pattern[adapter_name], self.lora_A[adapter_name]) if not r
             ))

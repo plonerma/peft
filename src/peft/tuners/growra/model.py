@@ -204,6 +204,8 @@ class GrowRAModel(LoraModel):
         if rank_pattern is None:
             rank_pattern = lora_config.rank_pattern
 
+        new_parameters = []
+
         for name, pattern in rank_pattern.items():
             if not isinstance(pattern, list):
                 raise ValueError("Unexpected type of is_reserve_rank")
@@ -240,7 +242,9 @@ class GrowRAModel(LoraModel):
             else:
                 ranknum = sum(pattern)
 
-            target.add_reserve_ranks(adapter_name, add_r)
+            ranks = target.add_reserve_ranks(adapter_name, add_r)
+
+            new_parameters.extend(ranks)
 
             #if lora_config.init_r > 0:
             #    with torch.no_grad():
@@ -250,6 +254,8 @@ class GrowRAModel(LoraModel):
 
             target.r[adapter_name] = ranknum
             target.rank_pattern[adapter_name] = pattern
+
+        return new_parameters
 
     def get_rank_pattern(self, adapter_name: str):
         rank_pattern: dict[str, list[bool]] = {}
@@ -279,3 +285,4 @@ class GrowRAModel(LoraModel):
         for module in self.modules():
             if isinstance(module, SVDLinear):
                 dropped_params.extend(module.drop_reserve(adapter_name))
+        return dropped_params
