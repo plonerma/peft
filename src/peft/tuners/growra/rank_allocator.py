@@ -12,18 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Callable, Iterable, Optional
 import logging
 import math
-from typing import Callable, Optional
+from collections import OrderedDict, defaultdict
 
 import torch
+from peft.utils.other import get_pattern_key
 
 from utils.orthonormalization import orthonormalize_model, normalize_model
 from .config import GrowRAConfig
 from .layer import SVDLinear
 from .model import GrowRAModel
 
-from peft.utils.other import get_pattern_key
+
 
 logger = logging.getLogger(__name__)
 
@@ -210,7 +212,18 @@ class RankAllocator:
             if param_index is None:
                 continue
 
-            del optimizer.state[param]
+            try:
+                del optimizer.state[param]
+            except KeyError:
+                logger.warning("%d state keys.", len(optimizer.state))
+                logger.warning(
+                    "Found parameter (%d, %s) in group %d, but not in optimizer state.",
+                    param_index,
+                    str(param.shape),
+                    group_index
+                )
+                raise
+
             del group["params"][param_index]
 
             if len(group["params"]) == 0:
@@ -235,6 +248,9 @@ class RankAllocator:
                     break
 
             if param_index is not None:
+                # Not yet added to the optimizer
+                # Note that even if we chose to add new params right away,
+                # the state may not have been initialized yet.
                 del self.new_reserve_params[param_index]
             else:
                 self.delete_param_from_groups(optimizer, param)
@@ -334,19 +350,17 @@ class RankAllocator:
             self.exp_avg_unc[n] = self.moving_avg(self.exp_avg_unc.get(n, None), unc, beta=self.beta2)
 
     def retrieve_scores(self, model) -> dict[str, torch.Tensor]:
+        """Return the scores for reserve ranks of each layer."""
         module_scores: dict[str, torch.Tensor] = {}
 
         # Calculate the importance score for each sub matrix
         for n, layer in model.named_modules():
             if isinstance(layer, SVDLinear):
-                reserve = layer.get_reserve_mask(self.adapter_name)
-
-                dtype = layer.lora_E[self.adapter_name][0].dtype
-                device = layer.lora_E[self.adapter_name][0].device
-                num_reserve = len(reserve)
-
                 if self.random_selection:
-                    module_scores[n] = torch.rand(num_reserve, device=device, dtype=dtype)
+                    module_scores[n] = torch.rand(
+                        self.peft_config.reserve_ranks,
+                        device="cpu"
+                    )
 
                 elif self.target_rank_pattern is not None:
                     target_rank_key = get_pattern_key(self.target_rank_pattern, n)
@@ -356,7 +370,7 @@ class RankAllocator:
                     reserve_ranks = self.reserve_ranks
                     remaining_ranks = target_rank - current_rank
 
-                    module_scores[n] = torch.full((num_reserve, ), -1, device=device, dtype=dtype)
+                    module_scores[n] = torch.full((self.peft_config.reserve_ranks, ), -1, device="cpu")
 
                     if remaining_ranks > 0:
                         mod = remaining_ranks % reserve_ranks
@@ -367,18 +381,22 @@ class RankAllocator:
                         if div > 0:
                             module_scores[n][mod:] = div
 
-                        module_scores[n] += 0.5 * torch.rand(num_reserve, device=device, dtype=dtype)
+                        module_scores[n] += 0.5 * torch.rand(
+                            self.peft_config.reserve_ranks,
+                            device="cpu",
+                        )
 
                 elif self.ignore_uncertainty:
-                    module_scores[n] = self.exp_avg_grad[n][reserve].abs()
-
+                    reserve = ~torch.tensor(layer.rank_pattern[self.adapter_name])
+                    module_scores[n] = self.exp_avg_grad[n][reserve].abs().cpu()
                 else:
-                    module_scores[n] = self.exp_avg_grad[n][reserve].abs() * self.exp_avg_unc[n][reserve]
+                    reserve = ~torch.tensor(layer.rank_pattern[self.adapter_name])
+                    module_scores[n] = (self.exp_avg_grad[n][reserve].abs() * self.exp_avg_unc[n][reserve]).cpu()
 
         return module_scores
 
-    def increase_layer_rank(self, layer: SVDLinear, ranks_to_add: list[bool]) -> None:
-        """Add the selected ranks to the layer.Viola Brand,
+    def increase_layer_rank(self, layer: SVDLinear, ranks_to_add: Iterable[int]) -> None:
+        """Add the selected ranks to the layer.
 
         Args:
             ranks_to_add: specifies either the number of ranks to add
@@ -395,18 +413,17 @@ class RankAllocator:
         layer.r[self.adapter_name] += num_added
         self.total_current_rank += num_added
 
-        assert len(ranks_to_add) == len(lora_E)
         assert len(layer.rank_pattern[self.adapter_name]) == len(lora_E)
 
-        # Make the existing lora_E parameters trainable
-        for i, (add, param_e) in enumerate(zip(ranks_to_add, lora_E)):
-            if not add:
-                continue
-            # Param already existed, but wasn't trained before
-            assert not layer.rank_pattern[self.adapter_name][i]
-            assert not param_e.requires_grad
+        reserve_rank_indices = tuple(i for i, non_r in enumerate(layer.rank_pattern[self.adapter_name]) if not non_r)
 
-            self.make_param_main(param_e, already_trained=False)
+        for reserve_index in ranks_to_add:
+            i = reserve_rank_indices[reserve_index]
+
+            assert not layer.rank_pattern[self.adapter_name][i]
+            assert not layer.lora_E[self.adapter_name][i].requires_grad
+
+            self.make_param_main(layer.lora_E[self.adapter_name][i], already_trained=False)
             self.make_param_main(layer.lora_A[self.adapter_name][i], already_trained=self.peft_config.advance_learn)
             self.make_param_main(layer.lora_B[self.adapter_name][i], already_trained=self.peft_config.advance_learn)
 
@@ -414,43 +431,62 @@ class RankAllocator:
 
         self.add_new_param(*layer.add_reserve_ranks(self.adapter_name, num_added), reserve=True)
 
+    @staticmethod
+    def get_topk_ranks(module_scores: dict[str, torch.Tensor], k: int) -> tuple[defaultdict[str, tuple[int, ...]], float]:
+        ranks_to_add: defaultdict[str, list[int, ...]] = defaultdict(list)
+
+        offsets: list[tuple[str, int]] = []
+        current_offset: int = 0
+        all_scores = []
+
+        for n, scores in module_scores.items():
+            offsets.append((n, current_offset))
+            current_offset += scores.size(0)
+
+            all_scores.append(scores)
+
+        values, indices  = torch.topk(torch.cat(all_scores), k, sorted=False)
+        increase_threshold = values.min().item() # values[-1].item()
+
+        offset_iterator = reversed(offsets)
+
+        layer, offset = next(offset_iterator)
+
+        logging.info(str(indices))
+        logging.info(str(offsets))
+
+        for idx in sorted(indices.tolist(), reverse=True):
+            while offset > idx:
+                layer, offset = next(offset_iterator)
+
+            ranks_to_add[layer].append(idx - offset)
+
+        return ranks_to_add, increase_threshold
+
     def increase_to_target_rank(self, model, optimizer):
-        module_scores = self.retrieve_scores(model)
-
-        metrics = {}
-
         # Calculate the increasing threshold
         k = min(self.top_h * self.reserve_ranks, self.total_target_rank - self.total_current_rank)
 
         if not k > 0:
             return float("Inf")
 
-        all_scores = torch.cat(list(module_scores.values()))
+        module_scores = self.retrieve_scores(model)
+        ranks_to_add, increase_threshold = self.get_topk_ranks(module_scores, k)
 
-        values, _ = torch.topk(all_scores, k)
-        increase_threshold = values[-1].item()
+        logger.info(
+            "Increase threshold: %e", increase_threshold
+        )
 
+        metrics = {}
         with torch.no_grad():
             for n, layer in model.named_modules():
                 if isinstance(layer, SVDLinear):
-                    ranks_to_add: list[bool]
+                    if len(ranks_to_add[n]) > 0:
 
-                    # one booelan per reserve rank
-                    ranks_to_add = (module_scores[n] >= increase_threshold).tolist()
-
-                    if any(ranks_to_add):
-                        # map the reserve rank flags to flags for the complete list of params
-                        add_rank = iter(ranks_to_add)
-
-                        # next(add_rank) is only called if the current rank is a reserve rank
-                        # otherwise, the iterator is not progressed (as we only have ranks_to_add
-                        # values for the reserve ranks)
-                        ranks_to_add = [(not p) and next(add_rank) for p in layer.rank_pattern[self.adapter_name]]
-
-                        self.increase_layer_rank(layer, ranks_to_add)
+                        self.increase_layer_rank(layer, sorted(ranks_to_add[n]))
 
                         self.peft_config.rank_pattern[n] = layer.rank_pattern
-                        logger.info("The lora parameters rank of %s increased by %d", n, sum(ranks_to_add))
+                        logger.info("The lora parameters rank of %s increased by %d", n, sum(ranks_to_add[n]))
 
                     # log metrics
                     metrics[f"num_rank/{n}"] = layer.r[self.adapter_name]

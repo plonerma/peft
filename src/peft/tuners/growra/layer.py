@@ -71,7 +71,7 @@ class GrowRALayer(LoraLayer):
 
         if r > 0:
             self.lora_A[adapter_name].append(nn.Parameter(torch.empty(r, self.in_features)))
-            self.lora_E[adapter_name].append(nn.Parameter(torch.empty(r, 1)))
+            self.lora_E[adapter_name].append(nn.Parameter(torch.empty(r)))
             self.lora_B[adapter_name].append(nn.Parameter(torch.empty(self.out_features, r)))
             self.rank_pattern[adapter_name].append(True)
 
@@ -118,73 +118,89 @@ class GrowRALayer(LoraLayer):
             msg = f"Weight init method `{init_lora_weights}` unkown."
             raise ValueError(msg)
 
-
-class GrowRAComputation(torch.autograd.Function):
+class GrowRAMainComputation(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input, A, B, e, reserve, scale_all_grads: bool = False):
-        # Only include non-reserve in the computation
+    @torch.amp.custom_fwd(device_type='cuda')
+    def forward(ctx, input, a, b, e, scale_grads: bool = False):
+        ctx.scale_all = scale_grads
 
-        #z = torch.einsum("...i,ri,r,or->...o", input, A[~reserve, ...], e[~reserve].squeeze(-1), B[..., ~reserve])
-        #z = B[:, ~reserve] @ (e * (A[~reserve, :] @ input.unsqueeze(-1))).squeeze(-1)
+        # Here, it would be faster to compute (e*a) first, but we need i_a for the backward pass as well
+        i_a = torch.matmul(input, a.mT)
+        pre_b = e * i_a
 
+        z = torch.matmul(pre_b, b.mT)
 
-        ctx.save_for_backward(input, A, B, e, reserve)
-        ctx.scale_all = scale_all_grads
-
-        A = A[~reserve, :]
-        e = e[~reserve, :]
-        B = B[:, ~reserve]
-
-        pre_b = e * (A @ input[..., :, None])
-
-        z = (B @ pre_b).squeeze(-1)
+        ctx.save_for_backward(input, a, b, e, i_a, pre_b)
 
         return z
 
     @staticmethod
     @torch.autograd.function.once_differentiable
+    @torch.amp.custom_bwd(device_type='cuda')
     def backward(ctx, grad_output):
-        input, A, B, e, reserve = ctx.saved_tensors
+        input, a, b, e, i_a, pre_b = ctx.saved_tensors
 
-        #device = grad_output.device
-        #dtype = grad_output.dtype
+        grad_pre_b = torch.matmul(grad_output, b)
 
-        #input = input.to(dtype=dtype)
-        #A = A.to(dtype=dtype)
-        #B = B.to(dtype=dtype)
-        #e = e.to(dtype=dtype).squeeze(-1).clone()
-        with torch.amp.autocast("cuda"):
-            e = e.detach().clone()
+        grad_input = torch.matmul(grad_pre_b, (e*a))
 
-            # o: index along output dimension
-            # r: index along ranks
-            # i: index along input dimension
+        grad_a, grad_b, grad_e = None, None, None
 
-            #grad_pre_B = torch.einsum("...o,or->...r", grad_output, B)
-            grad_pre_B = (grad_output[..., None, :] @ B).squeeze(-2)
+        # Reduce batch/sequence dimensions for efficient computation
+        input = input.view(-1, input.size(-1))
+        grad_output = grad_output.view(-1, grad_output.size(-1))
+        i_a = i_a.view(-1, i_a.size(-1))
 
-            # The gradient should be propagated
-            #grad_input = torch.einsum("ri,r,...r->...i", A, e, grad_pre_B)
-            grad_input = ((grad_pre_B[..., None, ~reserve] * e[~reserve].T) @ A[~reserve]).squeeze(-2)
+        grad_pre_b = grad_pre_b.view(-1, pre_b.size(-1))
 
-            # In the reserve, the magnitude is ignored to not scale down the gradient while in the already added ranks, the magnitude is used
-            e[reserve] = 1.0
+        if ctx.scale_all:
+            e = torch.sign(e)
 
-            if ctx.scale_all:
-                e = torch.sign(e)
+        if ctx.needs_input_grad[1]:
+            grad_a = torch.mm((grad_pre_b * e).mT, input)
 
-            #grad_B = torch.einsum("...o,...i,ri,r->or", grad_output, input, A, e)
-            grad_B = grad_output[..., :, None] @ (input[..., None, :] @ (A * e).T)
+        if ctx.needs_input_grad[2]:
+            grad_b = torch.mm(grad_output.mT, (i_a * e))
 
-            #e[reserve] = 1.0
-            #grad_A = torch.einsum("...r,...i,r->ri", grad_pre_B, input, e)
-            grad_A = (e * grad_pre_B[..., :, None]) @ input[..., None, :]
+        if ctx.needs_input_grad[3]:
+            grad_e = torch.mm(grad_pre_b.mT, i_a)
+
+        return grad_input, grad_a, grad_b, grad_e, None
 
 
-            #grad_e = torch.einsum("...r,...i,ri->r", grad_pre_B, input, A).unsqueeze(-1)
-            grad_e = (A @ input[..., :, None]) * grad_pre_B[..., None]
+class GrowRAReserveComputation(torch.autograd.Function):
+    @staticmethod
+    @torch.amp.custom_fwd(device_type='cuda')
+    def forward(ctx, input, a, b, e):
+        ctx.save_for_backward(input, a, b)
 
-            return grad_input, grad_A, grad_B, grad_e, None, None
+        return torch.zeros((*input.shape[:-1], b.shape[0]),  device=input.device)
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type='cuda')
+    def backward(ctx, grad_output):
+        input, a, b = ctx.saved_tensors
+
+        # Reduce batch/sequence dimensions for efficient computation
+        input = input.view(-1, input.size(-1))
+        grad_output = grad_output.view(-1, grad_output.size(-1))
+
+        # Compute intermediate values
+        i_a = torch.mm(input, a.mT)
+        grad_pre_b = torch.matmul(grad_output, b)
+
+        grad_a, grad_b, grad_e = None, None, None
+
+        if ctx.needs_input_grad[1]:
+            grad_a = torch.mm(grad_pre_b.mT, input)
+
+        if ctx.needs_input_grad[2]:
+            grad_b = torch.mm(grad_output.mT, i_a)
+
+        if ctx.needs_input_grad[3]:
+            grad_e = torch.mm(grad_pre_b.mT, i_a)
+
+        return None, grad_a, grad_b, grad_e
 
 
 class SVDLinear(nn.Module, GrowRALayer):
@@ -224,10 +240,7 @@ class SVDLinear(nn.Module, GrowRALayer):
 
         self.e_grad = None
 
-
         self.update_layer(adapter_name, init_r, lora_alpha, lora_dropout, init_lora_weights, target_r)
-        # self.add_reserve_ranks(adapter_name, reserve_ranks)
-        # self._move_adapter_to_device_of_base_layer(adapter_name)
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
         """
@@ -293,16 +306,14 @@ class SVDLinear(nn.Module, GrowRALayer):
         lora_E = torch.cat(tuple(self.lora_E[adapter]), 0)
         return transpose(lora_B @ (lora_A * lora_E), self.fan_in_fan_out) * self.get_scaling_coeff(adapter)
 
-    def backward_hook(self, param, grad, apply_sum=False):
+    def backward_hook(self, param, grad, index=None):
         """Note that this is the pre-accumulation gradient hook.
 
         If gradients are accumulated, we also need to do this here.
         """
         if self.reserve_rank_scoring:
-            if self.e_grad is None:
-                self.e_grad = grad.view(-1).detach().clone()
-            else:
-                self.e_grad += grad.view(-1).detach().clone()
+            self.e_grad[index:index+1] += grad.view(-1)
+
         else:
             self.ipt = (param.detach() * grad.detach()).abs().mean()
 
@@ -315,6 +326,7 @@ class SVDLinear(nn.Module, GrowRALayer):
             result = self.base_layer(x, *args, **kwargs)
         else:
             result = self.base_layer(x, *args, **kwargs)
+
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.lora_A.keys() or len(self.lora_A[active_adapter]) == 0:
                     continue
@@ -323,22 +335,37 @@ class SVDLinear(nn.Module, GrowRALayer):
                 x = x.to(self.lora_A[active_adapter][0].dtype)
 
                 if self.training:
+                    x = dropout(x)
+
                     if self.reserve_rank_scoring:
-                        lora_A = torch.cat(list(self.lora_A[active_adapter]), 0)
-                        lora_B = torch.cat(list(self.lora_B[active_adapter]), 1)
-                        lora_E = torch.cat(list(self.lora_E[active_adapter]), 0)
+                        if self.e_grad is None and not all(self.rank_pattern[active_adapter]):
+                            self.e_grad = torch.zeros(
+                                len(self.rank_pattern[active_adapter]),
+                                device=self.base_layer.weight.device
+                            )
 
-                        if torch.is_grad_enabled():
-                            # Note that this enables the gradient for the intermediate variable (concatenated Es, not the leaf parameters)
-                            if self.hook_handle is not None:
-                                self.hook_handle.remove()
-                            lora_E.requires_grad_(True)
-                            lora_E.register_hook(partial(self.backward_hook, lora_E))
+                        for i, (a, b, e, non_reserve) in enumerate(zip(
+                            self.lora_A[active_adapter],
+                            self.lora_B[active_adapter],
+                            self.lora_E[active_adapter],
+                            self.rank_pattern[active_adapter])):
 
-                        result += GrowRAComputation.apply(
-                            dropout(x), lora_A, lora_B, lora_E, self.get_reserve_mask(active_adapter),
-                            self.scale_all_grads,
-                        ) * self.get_scaling_coeff(active_adapter)
+                            if non_reserve:
+                                result += GrowRAMainComputation.apply(
+                                    x, a, b, e, self.scale_all_grads
+                                ) * self.get_scaling_coeff(active_adapter)
+
+                            else:
+                                e = e.clone()
+                                e.requires_grad_(True)
+                                e.register_hook(partial(self.backward_hook, e, index=i))
+
+                                r = GrowRAReserveComputation.apply(
+                                    x, a, b, e,
+                                ) * self.get_scaling_coeff(active_adapter)
+
+                                result += r
+
                     else:
                         w = self.get_delta_weight(active_adapter)
                         if torch.is_grad_enabled():
@@ -346,23 +373,13 @@ class SVDLinear(nn.Module, GrowRALayer):
                                 self.hook_handle.remove()
                             w.requires_grad_(True)
                             w.register_hook(partial(self.backward_hook, w))
-                        result += dropout(x) @ w.T
+                        result += x @ w.T
                 else:
-                    rank_pattern = self.rank_pattern[active_adapter]
-                    if any(rank_pattern):
-                        lora_A = torch.cat(
-                            [rank for rank, use in zip(self.lora_A[active_adapter], rank_pattern) if use], 0
-                        )
-                        lora_B = torch.cat(
-                            [rank for rank, use in zip(self.lora_B[active_adapter], rank_pattern) if use], 1
-                        )
-                        lora_E = torch.cat(
-                            [rank for rank, use in zip(self.lora_E[active_adapter], rank_pattern) if use], 0
-                        )
-
-                        result += (dropout(x) @ (lora_A * lora_E).T @ lora_B.T) * self.get_scaling_coeff(
-                            active_adapter
-                        )
+                    for a, b, e, non_reserve in zip(self.lora_A[active_adapter], self.lora_B[active_adapter], self.lora_E[active_adapter], self.rank_pattern[active_adapter]):
+                        if non_reserve:
+                            result +=GrowRAMainComputation.apply(
+                                x, a, b, e, self.scale_all_grads
+                            ) * self.get_scaling_coeff(active_adapter)
 
         return result
 
