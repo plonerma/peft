@@ -88,7 +88,7 @@ class RankAllocator:
         self.new_reserve_params = []
         self.old_reserve_params = []
 
-        self.reset_ipt()
+        self.reset_state()
 
     @property
     def total_target_rank(self) -> int:
@@ -298,7 +298,7 @@ class RankAllocator:
         self.new_reserve_params.clear()
         self.new_main_params.clear()
 
-    def reset_ipt(self):
+    def reset_state(self):
         if self.peft_config.reserve_rank_scoring:
             self.exp_avg_grad = {}
         else:
@@ -541,6 +541,10 @@ class RankAllocator:
                         model=model,
                         optimizer=optimizer
                     )
+
+                    if self.total_current_rank < self.total_target_rank:
+                        # Growth continues => Modules will be reinitialized after next growth step
+                        param_group_kws["remaining_steps"] = self.peft_config.growth_interval
 
                 self.update_param_groups(
                     optimizer,

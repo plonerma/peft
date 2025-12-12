@@ -50,7 +50,7 @@ class GrowRALayer(LoraLayer):
         self.rank_pattern = {}
         self.target_r = {}
 
-    def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, target_r):
+    def update_layer(self, *, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, target_r):
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
         self.target_r[adapter_name] = target_r
@@ -213,7 +213,6 @@ class SVDLinear(nn.Module, GrowRALayer):
         adapter_name: str,
         init_r: int = 0,
         target_r: int = 0,
-        reserve_ranks: int = 0,
         advance_learn: bool = True,
         lora_alpha: int = 1,
         lora_dropout: float = 0.0,
@@ -399,7 +398,7 @@ class SVDLinear(nn.Module, GrowRALayer):
             b = nn.Parameter(self.weight.new_empty((self.out_features, 1)), requires_grad=self.advance_learn)
 
             if self.init_lora_weights.lower() == "increlora":
-                nn.init.zeros_(e)
+                e.data.fill_(1e-5)
                 nn.init.normal_(a, mean=0.0, std=0.02)
                 nn.init.normal_(b, mean=0.0, std=0.02)
 

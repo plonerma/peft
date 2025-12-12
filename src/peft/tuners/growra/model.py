@@ -109,16 +109,17 @@ class GrowRAModel(LoraModel):
     ):
         kwargs = {
             "init_r": lora_config.init_r,
+            "lora_alpha": lora_config.lora_alpha,
+            "lora_dropout": lora_config.lora_dropout,
+            "init_lora_weights": lora_config.init_lora_weights,
             "target_r": lora_config.target_r,
-            "reserve_ranks": lora_config.reserve_ranks,
+
             "dynamic_scaling": lora_config.dynamic_scaling,
             "scale_all_grads": lora_config.growra_scale_all_grads,
             "advance_learn": lora_config.advance_learn,
             "reserve_rank_scoring": lora_config.reserve_rank_scoring,
-            "lora_alpha": lora_config.lora_alpha,
-            "lora_dropout": lora_config.lora_dropout,
+
             "fan_in_fan_out": lora_config.fan_in_fan_out,
-            "init_lora_weights": lora_config.init_lora_weights,
             "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
             "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
         }
@@ -134,13 +135,19 @@ class GrowRAModel(LoraModel):
             self._replace_module(parent, target_name, new_module, target)
         else:
             target.update_layer(
-                adapter_name,
-                lora_config.init_r,
-                lora_config.lora_alpha,
-                lora_config.lora_dropout,
-                lora_config.init_lora_weights,
-                lora_config.target_r,
+                adapter_name=adapter_name,
+                init_r=lora_config.init_r,
+                lora_alpha=lora_config.lora_alpha,
+                lora_dropout=lora_config.lora_dropout,
+                init_lora_weights=lora_config.init_lora_weights,
+                target_r=lora_config.target_r,
             )
+
+            target.init_lora_weights=lora_config.init_lora_weights
+            target.dynamic_scaling=lora_config.dynamic_scaling
+            target.scale_all_grads=lora_config.growra_scale_all_grads
+            target.advance_learn=lora_config.advance_learn
+            target.reserve_rank_scoring =lora_config.reserve_rank_scoring
 
     @staticmethod
     def _create_new_module(lora_config, adapter_name, target, **kwargs):
@@ -221,10 +228,6 @@ class GrowRAModel(LoraModel):
             key = ".".join(parts)
             _, target, _ = _get_submodules(self.model, key)
 
-            #lora_E_weights = target.lora_E[adapter_name]
-            #lora_A_weights = target.lora_A[adapter_name]
-            #lora_B_weights = target.lora_B[adapter_name]
-
             target.update_layer(
                 adapter_name,
                 lora_config.init_r,
@@ -241,16 +244,6 @@ class GrowRAModel(LoraModel):
                 ranknum = lora_config.init_r + sum(pattern) - 1
             else:
                 ranknum = sum(pattern)
-
-            ranks = target.add_reserve_ranks(adapter_name, add_r)
-
-            new_parameters.extend(ranks)
-
-            #if lora_config.init_r > 0:
-            #    with torch.no_grad():
-            #        target.lora_E[adapter_name][0].copy_(lora_E_weights[0])
-            #        target.lora_A[adapter_name][0].copy_(lora_A_weights[0])
-            #        target.lora_B[adapter_name][0].copy_(lora_B_weights[0])
 
             target.r[adapter_name] = ranknum
             target.rank_pattern[adapter_name] = pattern
