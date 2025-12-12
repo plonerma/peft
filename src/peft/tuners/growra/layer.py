@@ -118,6 +118,7 @@ class GrowRALayer(LoraLayer):
             msg = f"Weight init method `{init_lora_weights}` unkown."
             raise ValueError(msg)
 
+
 class GrowRAMainComputation(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_fwd(device_type='cuda')
@@ -142,7 +143,7 @@ class GrowRAMainComputation(torch.autograd.Function):
 
         grad_pre_b = torch.matmul(grad_output, b)
 
-        grad_input = torch.matmul(grad_pre_b, (e*a))
+        grad_input = torch.matmul(grad_pre_b, (torch.diag(e) @ a))
 
         grad_a, grad_b, grad_e = None, None, None
 
@@ -304,7 +305,7 @@ class SVDLinear(nn.Module, GrowRALayer):
         lora_A = torch.cat(tuple(self.lora_A[adapter]), 0)
         lora_B = torch.cat(tuple(self.lora_B[adapter]), 1)
         lora_E = torch.cat(tuple(self.lora_E[adapter]), 0)
-        return transpose(lora_B @ (lora_A * lora_E), self.fan_in_fan_out) * self.get_scaling_coeff(adapter)
+        return transpose(lora_B @ (torch.diag(lora_E) @ lora_A), self.fan_in_fan_out) * self.get_scaling_coeff(adapter)
 
     def backward_hook(self, param, grad, index=None):
         """Note that this is the pre-accumulation gradient hook.
@@ -391,7 +392,7 @@ class SVDLinear(nn.Module, GrowRALayer):
         parameters: list[nn.Parameter] = []
         for _ in range(add_r):
             e = nn.Parameter(
-                self.weight.new_full((1, 1), self.EPS),
+                self.weight.new_full((1, ), self.EPS),
                 requires_grad=False,
             )
             a = nn.Parameter(self.weight.new_empty((1, self.in_features)), requires_grad=self.advance_learn)

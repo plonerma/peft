@@ -15,7 +15,7 @@
 from typing import Callable, Iterable, Optional
 import logging
 import math
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 
 import torch
 from peft.utils.other import get_pattern_key
@@ -408,7 +408,7 @@ class RankAllocator:
         """
         lora_E = layer.lora_E[self.adapter_name]
 
-        num_added: int = sum(ranks_to_add)
+        num_added: int = len(ranks_to_add)
 
         layer.r[self.adapter_name] += num_added
         self.total_current_rank += num_added
@@ -485,8 +485,10 @@ class RankAllocator:
 
                         self.increase_layer_rank(layer, sorted(ranks_to_add[n]))
 
+                        assert len(ranks_to_add[n]) <= self.reserve_ranks
+
                         self.peft_config.rank_pattern[n] = layer.rank_pattern
-                        logger.info("The lora parameters rank of %s increased by %d", n, sum(ranks_to_add[n]))
+                        logger.info("The lora parameters rank of %s increased by %d", n, len(ranks_to_add[n]))
 
                     # log metrics
                     metrics[f"num_rank/{n}"] = layer.r[self.adapter_name]
