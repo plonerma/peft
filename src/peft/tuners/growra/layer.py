@@ -119,11 +119,17 @@ class GrowRALayer(LoraLayer):
             raise ValueError(msg)
 
 
-class GrowRAMainComputation(torch.autograd.Function):
+class GrowRAComputation(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_fwd(device_type='cuda')
-    def forward(ctx, input, a, b, e, scale_grads: bool = False):
+    def forward(ctx, input, a, b, e, reserve, ignore_reserve: bool, scale_grads: bool):
         ctx.scale_all = scale_grads
+        ctx.ignore_reserve = ignore_reserve
+
+        if ignore_reserve:
+            a = a[~reserve]
+            e = e[~reserve]
+            b = b[:, ~reserve]
 
         # Here, it would be faster to compute (e*a) first, but we need i_a for the backward pass as well
         i_a = torch.matmul(input, a.mT)
@@ -131,77 +137,49 @@ class GrowRAMainComputation(torch.autograd.Function):
 
         z = torch.matmul(pre_b, b.mT)
 
-        ctx.save_for_backward(input, a, b, e, i_a, pre_b)
+        ctx.save_for_backward(input, a, b, e, i_a, pre_b, reserve)
 
         return z
 
     @staticmethod
-    @torch.autograd.function.once_differentiable
     @torch.amp.custom_bwd(device_type='cuda')
     def backward(ctx, grad_output):
-        input, a, b, e, i_a, pre_b = ctx.saved_tensors
-
-        grad_pre_b = torch.matmul(grad_output, b)
-
-        grad_input = torch.matmul(grad_pre_b, (torch.diag(e) @ a))
-
-        grad_a, grad_b, grad_e = None, None, None
-
-        # Reduce batch/sequence dimensions for efficient computation
-        input = input.view(-1, input.size(-1))
-        grad_output = grad_output.view(-1, grad_output.size(-1))
-        i_a = i_a.view(-1, i_a.size(-1))
-
-        grad_pre_b = grad_pre_b.view(-1, pre_b.size(-1))
-
-        if ctx.scale_all:
-            e = torch.sign(e)
-
-        if ctx.needs_input_grad[1]:
-            grad_a = torch.mm((grad_pre_b * e).mT, input)
-
-        if ctx.needs_input_grad[2]:
-            grad_b = torch.mm(grad_output.mT, (i_a * e))
-
-        if ctx.needs_input_grad[3]:
-            grad_e = torch.mm(grad_pre_b.mT, i_a)
-
-        return grad_input, grad_a, grad_b, grad_e, None
+        with torch.no_grad():
+            input, a, b, e, i_a, pre_b, reserve = ctx.saved_tensors
 
 
-class GrowRAReserveComputation(torch.autograd.Function):
-    @staticmethod
-    @torch.amp.custom_fwd(device_type='cuda')
-    def forward(ctx, input, a, b, e):
-        ctx.save_for_backward(input, a, b)
+            grad_pre_b = torch.matmul(grad_output, b)
 
-        return torch.zeros((*input.shape[:-1], b.shape[0]),  device=input.device)
+            grad_input = torch.matmul(grad_pre_b[..., ~reserve], (torch.diag(e[~reserve]) @ a[~reserve]))
 
-    @staticmethod
-    @torch.amp.custom_bwd(device_type='cuda')
-    def backward(ctx, grad_output):
-        input, a, b = ctx.saved_tensors
+            grad_a, grad_b, grad_e = None, None, None
 
-        # Reduce batch/sequence dimensions for efficient computation
-        input = input.view(-1, input.size(-1))
-        grad_output = grad_output.view(-1, grad_output.size(-1))
+            # Reduce batch/sequence dimensions for efficient computation
+            input = input.view(-1, input.size(-1))
+            grad_output = grad_output.view(-1, grad_output.size(-1))
+            i_a = i_a.view(-1, i_a.size(-1))
 
-        # Compute intermediate values
-        i_a = torch.mm(input, a.mT)
-        grad_pre_b = torch.matmul(grad_output, b)
+            grad_pre_b = grad_pre_b.view(-1, pre_b.size(-1))
 
-        grad_a, grad_b, grad_e = None, None, None
+            if ctx.scale_all:
+                e = torch.sign(e.detach())
 
-        if ctx.needs_input_grad[1]:
-            grad_a = torch.mm(grad_pre_b.mT, input)
+            else:
+                e = e.detach().copy()
 
-        if ctx.needs_input_grad[2]:
-            grad_b = torch.mm(grad_output.mT, i_a)
+            e[reserve] = 1.0
 
-        if ctx.needs_input_grad[3]:
-            grad_e = torch.mm(grad_pre_b.mT, i_a)
+            if ctx.needs_input_grad[1]:
+                grad_a = torch.mm((grad_pre_b * e).mT, input)
 
-        return None, grad_a, grad_b, grad_e
+            if ctx.needs_input_grad[2]:
+                grad_b = torch.mm(grad_output.mT, (i_a * e))
+
+            if ctx.needs_input_grad[3]:
+                grad_e = torch.mm(grad_pre_b.mT, i_a)
+
+            return grad_input, grad_a, grad_b, grad_e, None, None, None
+
 
 
 class SVDLinear(nn.Module, GrowRALayer):
@@ -248,6 +226,7 @@ class SVDLinear(nn.Module, GrowRALayer):
             init_lora_weights=init_lora_weights,
             target_r=target_r
         )
+            target_r=target_r)
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
         """
@@ -319,7 +298,10 @@ class SVDLinear(nn.Module, GrowRALayer):
         If gradients are accumulated, we also need to do this here.
         """
         if self.reserve_rank_scoring:
-            self.e_grad[index:index+1] += grad.view(-1)
+            if self.e_grad is None:
+                self.e_grad = grad
+            else:
+                self.e_grad += grad
 
         else:
             self.ipt = (param.detach() * grad.detach()).abs().mean()
@@ -345,33 +327,19 @@ class SVDLinear(nn.Module, GrowRALayer):
                     x = dropout(x)
 
                     if self.reserve_rank_scoring:
-                        if self.e_grad is None and not all(self.rank_pattern[active_adapter]):
-                            self.e_grad = torch.zeros(
-                                len(self.rank_pattern[active_adapter]),
-                                device=self.base_layer.weight.device
-                            )
+                        lora_A = torch.cat(tuple(self.lora_A[active_adapter]), 0)
+                        lora_B = torch.cat(tuple(self.lora_B[active_adapter]), 1)
+                        lora_E = torch.cat(tuple(self.lora_E[active_adapter]), 0)
+                        reserve = self.get_reserve_mask(active_adapter)
 
-                        for i, (a, b, e, non_reserve) in enumerate(zip(
-                            self.lora_A[active_adapter],
-                            self.lora_B[active_adapter],
-                            self.lora_E[active_adapter],
-                            self.rank_pattern[active_adapter])):
+                        lora_E.requires_grad_(True)
+                        lora_E.register_hook(partial(self.backward_hook, lora_E))
 
-                            if non_reserve:
-                                result += GrowRAMainComputation.apply(
-                                    x, a, b, e, self.scale_all_grads
-                                ) * self.get_scaling_coeff(active_adapter)
+                        r = GrowRAComputation.apply(
+                            x, lora_A, lora_B, lora_E, reserve, False, self.scale_all_grads,
+                        ) * self.get_scaling_coeff(active_adapter)
 
-                            else:
-                                e = e.clone()
-                                e.requires_grad_(True)
-                                e.register_hook(partial(self.backward_hook, e, index=i))
-
-                                r = GrowRAReserveComputation.apply(
-                                    x, a, b, e,
-                                ) * self.get_scaling_coeff(active_adapter)
-
-                                result += r
+                        result += r
 
                     else:
                         w = self.get_delta_weight(active_adapter)
@@ -382,11 +350,17 @@ class SVDLinear(nn.Module, GrowRALayer):
                             w.register_hook(partial(self.backward_hook, w))
                         result += x @ w.T
                 else:
-                    for a, b, e, non_reserve in zip(self.lora_A[active_adapter], self.lora_B[active_adapter], self.lora_E[active_adapter], self.rank_pattern[active_adapter]):
-                        if non_reserve:
-                            result +=GrowRAMainComputation.apply(
-                                x, a, b, e, self.scale_all_grads
-                            ) * self.get_scaling_coeff(active_adapter)
+                    lora_A = torch.cat(tuple(self.lora_A[active_adapter]), 0)
+                    lora_B = torch.cat(tuple(self.lora_B[active_adapter]), 1)
+                    lora_E = torch.cat(tuple(self.lora_E[active_adapter]), 0)
+                    reserve = self.get_reserve_mask(active_adapter)
+
+                    r = GrowRAComputation.apply(
+                        x, lora_A, lora_B, lora_E, reserve, True, self.scale_all_grads,
+                    ) * self.get_scaling_coeff(active_adapter)
+
+                    result += r
+
 
         return result
 
