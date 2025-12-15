@@ -226,7 +226,6 @@ class SVDLinear(nn.Module, GrowRALayer):
             init_lora_weights=init_lora_weights,
             target_r=target_r
         )
-            target_r=target_r)
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
         """
