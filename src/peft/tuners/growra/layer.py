@@ -240,7 +240,14 @@ class SVDLinear(nn.Module, GrowRALayer):
 
         self.e_grad = None
 
-        self.update_layer(adapter_name, init_r, lora_alpha, lora_dropout, init_lora_weights, target_r)
+        self.update_layer(
+            adapter_name=adapter_name,
+            r=init_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            init_lora_weights=init_lora_weights,
+            target_r=target_r
+        )
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
         """

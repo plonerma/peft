@@ -229,11 +229,11 @@ class GrowRAModel(LoraModel):
             _, target, _ = _get_submodules(self.model, key)
 
             target.update_layer(
-                adapter_name,
-                lora_config.init_r,
-                lora_config.lora_alpha,
-                lora_config.lora_dropout,
-                lora_config.init_lora_weights,
+                adapter_name=adapter_name,
+                r=lora_config.init_r,
+                lora_alpha=lora_config.lora_alpha,
+                lora_dropout=lora_config.lora_dropout,
+                init_lora_weights=lora_config.init_lora_weights,
                 target_r=lora_config.target_r,
             )
 
