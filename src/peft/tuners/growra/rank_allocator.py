@@ -387,10 +387,10 @@ class RankAllocator:
                         )
 
                 elif self.ignore_uncertainty:
-                    reserve = ~torch.tensor(layer.rank_pattern[self.adapter_name])
+                    reserve = layer.get_reserve_mask(self.adapter_name)
                     module_scores[n] = self.exp_avg_grad[n][reserve].abs().cpu()
                 else:
-                    reserve = ~torch.tensor(layer.rank_pattern[self.adapter_name])
+                    reserve = layer.get_reserve_mask(self.adapter_name)
                     module_scores[n] = (self.exp_avg_grad[n][reserve].abs() * self.exp_avg_unc[n][reserve]).cpu()
 
         return module_scores
