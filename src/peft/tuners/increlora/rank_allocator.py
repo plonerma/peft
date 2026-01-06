@@ -98,6 +98,8 @@ class RankAllocator:
             self.total_modules,
         )
 
+        model.growing = True
+
         new_params = model.setup_reserve_ranks()
 
         optimizer.add_param_group(
@@ -305,6 +307,8 @@ class RankAllocator:
                         "remaining_steps": remaining_steps,
                     }
                 )
+        else:
+            model.growing = False
 
         if self.peft_config.orthonormalize:
             orthonormalize_model(

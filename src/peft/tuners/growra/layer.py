@@ -118,6 +118,12 @@ class GrowRALayer(LoraLayer):
             msg = f"Weight init method `{init_lora_weights}` unkown."
             raise ValueError(msg)
 
+    def _move_adapter_to_device_of_base_layer(self, adapter_name):
+        device = self.base_layer.weight.device
+        self.lora_A[adapter_name] = self.lora_A[adapter_name].to(device)
+        self.lora_E[adapter_name] = self.lora_E[adapter_name].to(device)
+        self.lora_B[adapter_name] = self.lora_B[adapter_name].to(device)
+
 
 class GrowRAComputation(torch.autograd.Function):
     @staticmethod
@@ -165,7 +171,7 @@ class GrowRAComputation(torch.autograd.Function):
                 e = torch.sign(e.detach())
 
             else:
-                e = e.detach().copy()
+                e = torch.empty_like(e).copy_(e)
 
             e[reserve] = 1.0
 
@@ -314,6 +320,7 @@ class SVDLinear(nn.Module, GrowRALayer):
             result = self.base_layer(x, *args, **kwargs)
         else:
             result = self.base_layer(x, *args, **kwargs)
+            torch_result_dtype = result.dtype
 
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.lora_A.keys() or len(self.lora_A[active_adapter]) == 0:
@@ -360,6 +367,7 @@ class SVDLinear(nn.Module, GrowRALayer):
 
                     result += r
 
+            result = result.to(torch_result_dtype)
 
         return result
 
@@ -371,11 +379,11 @@ class SVDLinear(nn.Module, GrowRALayer):
         parameters: list[nn.Parameter] = []
         for _ in range(add_r):
             e = nn.Parameter(
-                self.weight.new_full((1, ), self.EPS),
+                torch.full((1, ), self.EPS),
                 requires_grad=False,
             )
-            a = nn.Parameter(self.weight.new_empty((1, self.in_features)), requires_grad=self.advance_learn)
-            b = nn.Parameter(self.weight.new_empty((self.out_features, 1)), requires_grad=self.advance_learn)
+            a = nn.Parameter(torch.empty((1, self.in_features)), requires_grad=self.advance_learn)
+            b = nn.Parameter(torch.empty((self.out_features, 1)), requires_grad=self.advance_learn)
 
             if self.init_lora_weights.lower() == "increlora":
                 e.data.fill_(1e-5)
@@ -405,6 +413,8 @@ class SVDLinear(nn.Module, GrowRALayer):
 
             if self.advance_learn:
                 parameters.extend((a, b))
+
+        self._move_adapter_to_device_of_base_layer(adapter_name)
 
         return parameters
 

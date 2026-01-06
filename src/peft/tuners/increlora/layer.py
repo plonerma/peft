@@ -83,6 +83,12 @@ class IncreLoraLayer(LoraLayer):
         self._move_adapter_to_device_of_base_layer(adapter_name)
         self.set_adapter(self.active_adapters)
 
+    def _move_adapter_to_device_of_base_layer(self, adapter_name):
+        device = self.base_layer.weight.device
+        self.lora_A[adapter_name] = self.lora_A[adapter_name].to(device)
+        self.lora_E[adapter_name] = self.lora_E[adapter_name].to(device)
+        self.lora_B[adapter_name] = self.lora_B[adapter_name].to(device)
+
     def reset_lora_parameters(self, adapter_name, init_lora_weights):
         if init_lora_weights.lower() == "increlora":
             if adapter_name in self.lora_A.keys():
@@ -197,6 +203,7 @@ class SVDLinear(nn.Module, IncreLoraLayer):
         lora_A = torch.cat(tuple(self.lora_A[adapter]), 0)
         lora_B = torch.cat(tuple(self.lora_B[adapter]), 1)
         lora_E = torch.cat(tuple(self.lora_E[adapter]), 0)
+
         return transpose(lora_B @ (lora_A * lora_E), self.fan_in_fan_out) * self.get_scaling_coeff(adapter)
 
     def backward_hook(self, param, grad, apply_sum=False):
@@ -213,6 +220,8 @@ class SVDLinear(nn.Module, IncreLoraLayer):
         # self.score = torch.mean((grad_Matrix ** 2).detach())
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        assert self.lora_A["default"][0].dtype == torch.float32, str(self.lora_A["default"][0].dtype)
+
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
@@ -221,6 +230,8 @@ class SVDLinear(nn.Module, IncreLoraLayer):
             result = self.base_layer(x, *args, **kwargs)
         else:
             result = self.base_layer(x, *args, **kwargs)
+            torch_result_dtype = result.dtype
+
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.lora_A.keys() or len(self.lora_A[active_adapter]) == 0:
                     continue
@@ -252,6 +263,7 @@ class SVDLinear(nn.Module, IncreLoraLayer):
                         result += (dropout(x) @ (lora_A * lora_E).T @ lora_B.T) * self.get_scaling_coeff(
                             active_adapter
                         )
+                        print(x.dtype, result.dtype, lora_A.dtype)
                 else:
                     rank_pattern = self.rank_pattern[active_adapter]
                     if any(rank_pattern):
@@ -269,6 +281,8 @@ class SVDLinear(nn.Module, IncreLoraLayer):
                             active_adapter
                         )
 
+            result = result.to(torch_result_dtype)
+
         return result
 
     def __repr__(self) -> str:
@@ -279,11 +293,11 @@ class SVDLinear(nn.Module, IncreLoraLayer):
         parameters: list[nn.Parameter] = []
         for _ in range(add_r):
             e = nn.Parameter(
-                self.weight.new_full((1, 1), self.EPS),
+                torch.full((1, 1), self.EPS),
                 requires_grad=False,
             )
-            a = nn.Parameter(self.weight.new_empty((1, self.in_features)), requires_grad=True)
-            b = nn.Parameter(self.weight.new_empty((self.out_features, 1)), requires_grad=True)
+            a = nn.Parameter(torch.empty((1, self.in_features)), requires_grad=True)
+            b = nn.Parameter(torch.empty((self.out_features, 1)), requires_grad=True)
             nn.init.normal_(a, mean=0.0, std=0.02)
             nn.init.normal_(b, mean=0.0, std=0.02)
             self.lora_E[adapter_name].append(e)
@@ -293,6 +307,8 @@ class SVDLinear(nn.Module, IncreLoraLayer):
             self.rank_pattern[adapter_name].append(False)
 
             parameters.extend((a, b))
+
+        self._move_adapter_to_device_of_base_layer(adapter_name)
         return parameters
 
     def get_reserve_mask(self, adapter_name):
