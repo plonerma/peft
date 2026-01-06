@@ -138,6 +138,8 @@ class RankAllocator:
             total_incre_step / total_steps,
         )
 
+        assert total_incre_step <= total_steps, "Growth cannot be completed with the current settings."
+
         new_params = model.setup_reserve_ranks()
 
         self.add_new_param(*new_params, reserve=True)
