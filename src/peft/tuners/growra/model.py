@@ -77,6 +77,10 @@ class GrowRAModel(LoraModel):
         else:
             self.trainable_adapter_name = adapter_name
 
+        if config.rank_pattern is not None:
+            print("RESIZING modules")
+            self.resize_modules_by_rank_pattern(adapter_name="default", rank_pattern=config.rank_pattern)
+
     def _check_new_adapter_config(self, config: LoraConfig) -> None:
         """
         A helper method to check the config when a new adapter is being added.
@@ -215,7 +219,7 @@ class GrowRAModel(LoraModel):
 
         for name, pattern in rank_pattern.items():
             if not isinstance(pattern, list):
-                raise ValueError("Unexpected type of is_reserve_rank")
+                raise ValueError("Unexpected type of rank_pattern")
 
             parts = name.split(".")
 
@@ -235,18 +239,8 @@ class GrowRAModel(LoraModel):
                 lora_dropout=lora_config.lora_dropout,
                 init_lora_weights=lora_config.init_lora_weights,
                 target_r=lora_config.target_r,
+                rank_pattern=pattern,
             )
-
-            add_r = len(pattern)
-
-            if lora_config.init_r > 0:
-                add_r -= 1
-                ranknum = lora_config.init_r + sum(pattern) - 1
-            else:
-                ranknum = sum(pattern)
-
-            target.r[adapter_name] = ranknum
-            target.rank_pattern[adapter_name] = pattern
 
         return new_parameters
 
@@ -263,6 +257,11 @@ class GrowRAModel(LoraModel):
 
         for n, module in self.named_modules():
             if isinstance(module, SVDLinear):
+
+                if not all(module.rank_pattern[self.trainable_adapter_name]):
+                    msg = f"Trying to set up reserve ranks, but module {n} already has reserve ranks: {module.rank_pattern[self.trainable_adapter_name]}"
+                    raise RuntimeError(msg)
+
                 new_params.extend(
                     module.add_reserve_ranks(
                         self.trainable_adapter_name,

@@ -50,10 +50,11 @@ class GrowRALayer(LoraLayer):
         self.rank_pattern = {}
         self.target_r = {}
 
-    def update_layer(self, *, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, target_r):
-        self.r[adapter_name] = r
+    def update_layer(self, *, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, target_r, rank_pattern = None):
         self.lora_alpha[adapter_name] = lora_alpha
         self.target_r[adapter_name] = target_r
+
+        self.init_lora_weights = init_lora_weights
 
         if lora_dropout > 0.0:
             lora_dropout_layer = nn.Dropout(p=lora_dropout)
@@ -69,14 +70,29 @@ class GrowRALayer(LoraLayer):
 
         self.rank_pattern[adapter_name] = []
 
-        if r > 0:
-            self.lora_A[adapter_name].append(nn.Parameter(torch.empty(r, self.in_features)))
-            self.lora_E[adapter_name].append(nn.Parameter(torch.empty(r)))
-            self.lora_B[adapter_name].append(nn.Parameter(torch.empty(self.out_features, r)))
-            self.rank_pattern[adapter_name].append(True)
+
+        self.r[adapter_name] = 0
+
+        if rank_pattern:
+            self.r[adapter_name] = 0
+
+            for i, non_reserve in enumerate(rank_pattern):
+                add_r = 1 if i > 0 or r == 0 else r
+                self.add_rank(adapter_name, non_reserve=non_reserve, size=add_r)
+
+            assert self.rank_pattern[adapter_name] == rank_pattern
+
+            # Esnure identity, not just same values
+            self.rank_pattern[adapter_name] = rank_pattern
+
+        elif r > 0:
+            self.add_rank(adapter_name, non_reserve=True, size=r)
+
+        assert len(self.rank_pattern[adapter_name]) == len(self.lora_A[adapter_name])
 
         # The current rank
         self.scaling[adapter_name] = lora_alpha if lora_alpha > 0 else float(r)
+
         if init_lora_weights:
             self.reset_lora_parameters(adapter_name, init_lora_weights)
 
@@ -85,38 +101,6 @@ class GrowRALayer(LoraLayer):
 
     def reset_lora_parameters(self, adapter_name, init_lora_weights):
         self.init_lora_weights = init_lora_weights
-        if init_lora_weights.lower() == "increlora":
-            if adapter_name in self.lora_A.keys():
-                for p in self.lora_E[adapter_name]:
-                    nn.init.zeros_(p)
-
-                for p in chain(self.lora_A[adapter_name], self.lora_B[adapter_name]):
-                    nn.init.normal_(p, mean=0.0, std=0.02)
-        elif init_lora_weights.lower() == "lora":
-            if adapter_name in self.lora_A.keys():
-                for p in self.lora_E[adapter_name]:
-                    nn.init.ones_(p)
-
-                for p in self.lora_A[adapter_name]:
-                    nn.init.kaiming_uniform_(p, a=math.sqrt(5))
-
-                for p in self.lora_B[adapter_name]:
-                    nn.init.zeros_(p)
-
-        elif init_lora_weights.lower() == "growra":
-            if adapter_name in self.lora_A.keys():
-                for p in self.lora_E[adapter_name]:
-                    nn.init.zeros_(p)
-
-                for p in self.lora_A[adapter_name]:
-                    nn.init.kaiming_uniform_(p, a=math.sqrt(5), nonlinearity="linear", mode="fan_in")
-
-                for p in self.lora_B[adapter_name]:
-                    nn.init.kaiming_uniform_(p, a=math.sqrt(5), nonlinearity="linear", mode="fan_out")
-
-        else:
-            msg = f"Weight init method `{init_lora_weights}` unkown."
-            raise ValueError(msg)
 
     def _move_adapter_to_device_of_base_layer(self, adapter_name):
         device = self.base_layer.weight.device
@@ -132,40 +116,46 @@ class GrowRAComputation(torch.autograd.Function):
         ctx.scale_all = scale_grads
         ctx.ignore_reserve = ignore_reserve
 
+        ctx.save_for_backward(input, a, b, e, reserve)
+
         if ignore_reserve:
+            if torch.all(reserve):
+                return torch.zeros(
+                    (*input.shape[:-1], b.shape[0]),
+                    dtype=input.dtype, device=input.device
+                )
+
             a = a[~reserve]
             e = e[~reserve]
             b = b[:, ~reserve]
 
-        # Here, it would be faster to compute (e*a) first, but we need i_a for the backward pass as well
-        i_a = torch.matmul(input, a.mT)
-        pre_b = e * i_a
-
-        z = torch.matmul(pre_b, b.mT)
-
-        ctx.save_for_backward(input, a, b, e, i_a, pre_b, reserve)
-
-        return z
+        return torch.matmul(torch.matmul(input, a.mT @ torch.diag(e)), b.mT)
 
     @staticmethod
     @torch.amp.custom_bwd(device_type='cuda')
     def backward(ctx, grad_output):
         with torch.no_grad():
-            input, a, b, e, i_a, pre_b, reserve = ctx.saved_tensors
-
+            input, a, b, e, reserve = ctx.saved_tensors
 
             grad_pre_b = torch.matmul(grad_output, b)
 
-            grad_input = torch.matmul(grad_pre_b[..., ~reserve], (torch.diag(e[~reserve]) @ a[~reserve]))
+            if ctx.needs_input_grad[0] and not reserve.all():
+                ea = torch.diag(e[~reserve]) @ a[~reserve]
+                grad_input = torch.matmul(grad_pre_b[..., ~reserve], ea)
+
+            elif ctx.needs_input_grad[0]:
+                grad_input = torch.zeros_like(input)
+
+            else:
+                grad_input = None
 
             grad_a, grad_b, grad_e = None, None, None
 
             # Reduce batch/sequence dimensions for efficient computation
             input = input.view(-1, input.size(-1))
             grad_output = grad_output.view(-1, grad_output.size(-1))
-            i_a = i_a.view(-1, i_a.size(-1))
 
-            grad_pre_b = grad_pre_b.view(-1, pre_b.size(-1))
+            grad_pre_b = grad_pre_b.view(-1, grad_pre_b.size(-1))
 
             if ctx.scale_all:
                 e = torch.sign(e.detach())
@@ -178,11 +168,14 @@ class GrowRAComputation(torch.autograd.Function):
             if ctx.needs_input_grad[1]:
                 grad_a = torch.mm((grad_pre_b * e).mT, input)
 
+            if ctx.needs_input_grad[2] or ctx.needs_input_grad[3]:
+                i_a = torch.mm(input, a.mT)
+
             if ctx.needs_input_grad[2]:
-                grad_b = torch.mm(grad_output.mT, (i_a * e))
+                grad_b = torch.mm(grad_output.mT, e*i_a)
 
             if ctx.needs_input_grad[3]:
-                grad_e = torch.mm(grad_pre_b.mT, i_a)
+                grad_e = torch.sum(grad_pre_b * i_a, dim=0)
 
             return grad_input, grad_a, grad_b, grad_e, None, None, None
 
@@ -375,44 +368,57 @@ class SVDLinear(nn.Module, GrowRALayer):
         rep = super().__repr__()
         return "growra." + rep
 
+
+    def add_rank(self, adapter_name, *, non_reserve: bool = True, size: int = 1) -> list[nn.Parameter]:
+        e = nn.Parameter(
+            torch.full((size, ), self.EPS),
+            requires_grad=non_reserve,
+        )
+        a = nn.Parameter(torch.empty((size, self.in_features)), requires_grad=non_reserve or self.advance_learn)
+        b = nn.Parameter(torch.empty((self.out_features, size)), requires_grad=non_reserve or self.advance_learn)
+
+        if self.init_lora_weights.lower() == "increlora":
+            e.data.fill_(1e-5)
+            nn.init.normal_(a, mean=0.0, std=0.02)
+            nn.init.normal_(b, mean=0.0, std=0.02)
+
+        elif self.init_lora_weights.lower() == "lora":
+
+            nn.init.ones_(e)
+            nn.init.kaiming_uniform_(a, a=math.sqrt(5))
+            nn.init.zeros_(b)
+
+        elif self.init_lora_weights.lower() == "growra":
+            nn.init.zeros_(e)
+            nn.init.kaiming_uniform_(a, a=math.sqrt(5), nonlinearity="linear", mode="fan_in")
+            nn.init.kaiming_uniform_(b, a=math.sqrt(5), nonlinearity="linear", mode="fan_out")
+
+        else:
+            msg = f"Weight init method `{self.init_lora_weights}` unkown."
+            raise ValueError(msg)
+
+        self.lora_E[adapter_name].append(e)
+        self.lora_A[adapter_name].append(a)
+        self.lora_B[adapter_name].append(b)
+
+        self.rank_pattern[adapter_name].append(non_reserve)
+
+        if non_reserve:
+            self.r[adapter_name] += size
+            return [a, b, e]
+
+        elif self.advance_learn:
+            return [a, b]
+
+        else:
+            return []
+
+
     def add_reserve_ranks(self, adapter_name: str, add_r: int) -> list[nn.Parameter]:
         parameters: list[nn.Parameter] = []
+
         for _ in range(add_r):
-            e = nn.Parameter(
-                torch.full((1, ), self.EPS),
-                requires_grad=False,
-            )
-            a = nn.Parameter(torch.empty((1, self.in_features)), requires_grad=self.advance_learn)
-            b = nn.Parameter(torch.empty((self.out_features, 1)), requires_grad=self.advance_learn)
-
-            if self.init_lora_weights.lower() == "increlora":
-                e.data.fill_(1e-5)
-                nn.init.normal_(a, mean=0.0, std=0.02)
-                nn.init.normal_(b, mean=0.0, std=0.02)
-
-            elif self.init_lora_weights.lower() == "lora":
-
-                nn.init.ones_(e)
-                nn.init.kaiming_uniform_(a, a=math.sqrt(5))
-                nn.init.zeros_(b)
-
-            elif self.init_lora_weights.lower() == "growra":
-                nn.init.zeros_(e)
-                nn.init.kaiming_uniform_(a, a=math.sqrt(5), nonlinearity="linear", mode="fan_in")
-                nn.init.kaiming_uniform_(b, a=math.sqrt(5), nonlinearity="linear", mode="fan_out")
-
-            else:
-                msg = f"Weight init method `{self.init_lora_weights}` unkown."
-                raise ValueError(msg)
-
-            self.lora_E[adapter_name].append(e)
-            self.lora_A[adapter_name].append(a)
-            self.lora_B[adapter_name].append(b)
-
-            self.rank_pattern[adapter_name].append(False)
-
-            if self.advance_learn:
-                parameters.extend((a, b))
+            parameters.extend(self.add_rank(adapter_name, non_reserve=False))
 
         self._move_adapter_to_device_of_base_layer(adapter_name)
 

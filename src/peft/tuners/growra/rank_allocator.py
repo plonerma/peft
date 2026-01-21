@@ -447,15 +447,17 @@ class RankAllocator:
 
             all_scores.append(scores)
 
+        print("all scores", torch.cat(all_scores).shape)
+
         values, indices  = torch.topk(torch.cat(all_scores), k, sorted=False)
         increase_threshold = values.min().item() # values[-1].item()
+
+
+        print(offsets, list(sorted(indices.tolist(), reverse=True)))
 
         offset_iterator = reversed(offsets)
 
         layer, offset = next(offset_iterator)
-
-        logging.info(str(indices))
-        logging.info(str(offsets))
 
         for idx in sorted(indices.tolist(), reverse=True):
             while offset > idx:
@@ -475,6 +477,8 @@ class RankAllocator:
         module_scores = self.retrieve_scores(model)
         ranks_to_add, increase_threshold = self.get_topk_ranks(module_scores, k)
 
+        print(ranks_to_add)
+
         logger.info(
             "Increase threshold: %e", increase_threshold
         )
@@ -487,7 +491,7 @@ class RankAllocator:
 
                         self.increase_layer_rank(layer, sorted(ranks_to_add[n]))
 
-                        assert len(ranks_to_add[n]) <= self.reserve_ranks
+                        assert len(ranks_to_add[n]) <= self.reserve_ranks, f"Attempting to increase rank by {len(ranks_to_add[n])}, but only {self.reserve_ranks} reserve ranks"
 
                         self.peft_config.rank_pattern[n] = layer.rank_pattern
                         logger.info("The lora parameters rank of %s increased by %d", n, len(ranks_to_add[n]))
@@ -598,6 +602,8 @@ class RankAllocator:
 
                 for n, layer in model.named_modules():
                     if isinstance(layer, SVDLinear):
+                        assert len(layer.lora_A[self.adapter_name]) > 0
+
                         wA = torch.cat(list(layer.lora_A[self.adapter_name]), 0)
                         wB = torch.cat(list(layer.lora_B[self.adapter_name]), 1)
                         mat_cov_A = wA @ wA.T
@@ -605,8 +611,8 @@ class RankAllocator:
                         nla, ola = compute_and_log(mat_cov_A, n + ".lora_A")
                         nlb, olb = compute_and_log(mat_cov_B, n + ".lora_B")
 
-                        orthogonal_loss_sum += ola + olb
-                        normalization_loss_sum += nla + nlb
+                        orthogonal_loss_sum += (ola + olb) / wA.size(0)
+                        normalization_loss_sum += (nla + nlb) / wA.size(0)
 
                         num_elements += 2
 
